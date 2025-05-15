@@ -16,10 +16,10 @@ train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
 python3 -m verl.trainer.main_ppo \
-    actor_rollout_ref.ref.strategy=megatron \
-    actor_rollout_ref.actor.strategy=megatron \
-    critic.strategy=megatron  \
-    reward_model.strategy=megatron \
+    actor_rollout_ref.ref.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    critic.strategy=fsdp2  \
+    reward_model.strategy=fsdp2 \
     algorithm.adv_estimator=gae \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
