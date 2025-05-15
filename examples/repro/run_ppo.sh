@@ -29,7 +29,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path="Qwen/Qwen2.5-3B-Instruct" \
+    actor_rollout_ref.model.path="Qwen/Qwen2.5-0.5B-Instruct" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
@@ -47,13 +47,13 @@ python3 -m verl.trainer.main_ppo \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.optim.lr_warmup_steps_ratio=0.05 \
-    critic.model.path="sfairXC/FsfairX-LLaMA3-RM-v0.1" \
+    critic.model.path="Qwen/Qwen2.5-0.5B-Instruct" \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=32 \
     critic.model.fsdp_config.param_offload=False \
     critic.model.fsdp_config.optimizer_offload=False \
     reward_model.enable=True \
-    reward_model.model.path="sfairXC/FsfairX-LLaMA3-RM-v0.1" \
+    reward_model.model.path="Qwen/Qwen2.5-0.5B-Instruct" \
     reward_model.model.use_remove_padding=True \
     reward_model.model.fsdp_config.param_offload=True \
     reward_model.micro_batch_size_per_gpu=32 \
