@@ -16,10 +16,10 @@ train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
 python3 -m verl.trainer.main_ppo \
-    actor_rollout_ref.ref.strategy=fsdp2 \
-    actor_rollout_ref.actor.strategy=fsdp2 \
-    critic.strategy=fsdp2  \
-    reward_model.strategy=fsdp2 \
+    actor_rollout_ref.ref.strategy=megatron \
+    actor_rollout_ref.actor.strategy=megatron \
+    critic.strategy=megatron  \
+    reward_model.strategy=megatron \
     algorithm.adv_estimator=gae \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
@@ -30,6 +30,11 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='error' \
     data.return_raw_chat=True \
     actor_rollout_ref.model.path="meta-llama/Llama-3.2-1B-Instruct" \
+    actor_rollout_ref.actor.profile.use_profiler=True \
+    actor_rollout_ref.actor.profile.profile_ranks=[0] \
+    actor_rollout_ref.actor.profile.begin_step=0 \
+    actor_rollout_ref.actor.profile.end_step=1 \
+    actor_rollout_ref.actor.profile.save_path="./profile" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
