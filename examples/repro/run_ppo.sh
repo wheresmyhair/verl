@@ -52,7 +52,7 @@ python3 -m verl.trainer.main_ppo \
     critic.ppo_micro_batch_size_per_gpu=32 \
     critic.model.fsdp_config.param_offload=False \
     critic.model.fsdp_config.optimizer_offload=False \
-    reward_model.enable=True \
+    reward_model.enable=False \
     reward_model.model.path="meta-llama/Llama-3.2-1B-Instruct" \
     reward_model.model.use_remove_padding=True \
     reward_model.model.fsdp_config.param_offload=True \
