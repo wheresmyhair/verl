@@ -147,7 +147,9 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
             
-        self.prof = Profiler()
+        self.prof_update_actor = Profiler(name='update_actor')
+        self.prof_log_prob = Profiler(name='log_prob')
+        self.prof_ref_log_prob = Profiler(name='ref_log_prob')
 
     def _build_model_optimizer(
         self,
@@ -566,7 +568,7 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
-        self.prof.start()
+        self.prof_update_actor.start()
         data = data.to(torch.cuda.current_device())
 
         assert self._is_actor
@@ -605,8 +607,8 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
-        self.prof.stop_and_save()
-        self.prof.stop_trace()
+        self.prof_update_actor.stop_and_save()
+        self.prof_update_actor.stop_trace()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -649,7 +651,7 @@ class ActorRolloutRefWorker(Worker):
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         
-        self.prof.start()
+        self.prof_log_prob.start()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
@@ -681,15 +683,15 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
-        self.prof.stop_and_save()
-        self.prof.stop_trace()
+        self.prof_log_prob.stop_and_save()
+        self.prof_log_prob.stop_trace()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 
-        self.prof.start()
+        self.prof_ref_log_prob.start()
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
 
@@ -711,8 +713,8 @@ class ActorRolloutRefWorker(Worker):
         if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
             self.ref_policy.actor_module._handle.reshard(True)
 
-        self.prof.stop_and_save()
-        self.prof.stop_trace()
+        self.prof_ref_log_prob.stop_and_save()
+        self.prof_ref_log_prob.stop_trace()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

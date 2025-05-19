@@ -24,14 +24,15 @@ from dataclasses import dataclass, field
 class SimpleCfg:
     use_profile: bool = True
     step_start: int = 0
-    step_end: int = 1
+    step_end: int = 5
     profile_ranks: list = field(default_factory=lambda: [0])
     save_path: str = "./profile"
 
 class Profiler:
-    def __init__(self, config = None):
+    def __init__(self, config = None, name: str = None):
         
         # note : if we do not set use_profile, it will be set as None, so that all function will be skip
+        self.name = name
         self.config = config if config is not None else SimpleCfg()
         self.skip_prof = False
         self.saved = False
@@ -87,7 +88,7 @@ class Profiler:
         if self.prof is not None and not self.saved:
             if not os.path.exists(self.config.save_path):
                 os.makedirs(self.config.save_path)
-            save_file_name = f"/prof_start_{self.config.step_start}_end_{self.config.step_end}_rank_{self.rank}.json"
+            save_file_name = f"/prof_name_{self.name}_start_{self.config.step_start}_end_{self.config.step_end}_rank_{self.rank}.json"
             print(f"[Profiler] Saving trace to {self.config.save_path + save_file_name}")
             self.prof.export_chrome_trace(self.config.save_path + save_file_name)
             self.skip_prof = True
