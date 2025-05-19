@@ -18,14 +18,14 @@ import torch
 import torch.distributed
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class SimpleCfg:
     use_profile: bool = True
     step_start: int = 0
     step_end: int = 1
-    profile_ranks: list = [0]
+    profile_ranks: list = field(default_factory=lambda: [0])
     save_path: str = "./profile"
 
 class Profiler:
