@@ -147,9 +147,9 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
             
-        self.prof_update_actor = Profiler(name='update_actor')
-        self.prof_log_prob = Profiler(name='log_prob')
-        self.prof_ref_log_prob = Profiler(name='ref_log_prob')
+        # self.prof_update_actor = Profiler(name='update_actor')
+        # self.prof_log_prob = Profiler(name='log_prob')
+        # self.prof_ref_log_prob = Profiler(name='ref_log_prob')
 
     def _build_model_optimizer(
         self,
@@ -566,8 +566,9 @@ class ActorRolloutRefWorker(Worker):
             )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def update_actor(self, data: DataProto):
+    def update_actor(self, data: DataProto, step: int):
         # Support all hardwares
+        self.prof_update_actor = Profiler(name=f"update_actor_step_{step}")
         self.prof_update_actor.start()
         data = data.to(torch.cuda.current_device())
 
@@ -648,9 +649,10 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_log_prob(self, data: DataProto):
+    def compute_log_prob(self, data: DataProto, step: int):
         assert self._is_actor
         
+        self.prof_log_prob = Profiler(name=f"log_prob_step_{step}")
         self.prof_log_prob.start()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -688,9 +690,10 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_ref_log_prob(self, data: DataProto):
+    def compute_ref_log_prob(self, data: DataProto, step: int):
         assert self._is_ref
 
+        self.prof_ref_log_prob = Profiler(name=f"ref_log_prob_step_{step}")
         self.prof_ref_log_prob.start()
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
