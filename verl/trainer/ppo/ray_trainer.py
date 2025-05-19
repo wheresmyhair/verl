@@ -883,10 +883,9 @@ class RayPPOTrainer:
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                os.environ["VERL_PROF_GLOB_STEP"] = str(self.global_steps)
                 metrics = {}
                 timing_raw = {}
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info={"cur_step": self.global_steps})
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]

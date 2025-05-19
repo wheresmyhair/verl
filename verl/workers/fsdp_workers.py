@@ -568,8 +568,7 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
-        step = os.environ.get("VERL_PROF_GLOB_STEP", 0)
-        self.prof_update_actor = Profiler(name=f"update_actor_step_{step}")
+        self.prof_update_actor = Profiler(name=f"update_actor_step_{data.meta_info['cur_step']}")
         self.prof_update_actor.start()
         data = data.to(torch.cuda.current_device())
 
@@ -653,8 +652,7 @@ class ActorRolloutRefWorker(Worker):
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         
-        step = os.environ.get("VERL_PROF_GLOB_STEP", 0)
-        self.prof_log_prob = Profiler(name=f"log_prob_step_{step}")
+        self.prof_log_prob = Profiler(name=f"log_prob_step_{data.meta_info['cur_step']}")
         self.prof_log_prob.start()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -695,8 +693,7 @@ class ActorRolloutRefWorker(Worker):
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 
-        step = os.environ.get("VERL_PROF_GLOB_STEP", 0)
-        self.prof_ref_log_prob = Profiler(name=f"ref_log_prob_step_{step}")
+        self.prof_ref_log_prob = Profiler(name=f"ref_log_prob_step_{data.meta_info['cur_step']}")
         self.prof_ref_log_prob.start()
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
