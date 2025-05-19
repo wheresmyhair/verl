@@ -18,17 +18,28 @@ import torch
 import torch.distributed
 
 
+from dataclasses import dataclass
+
+@dataclass
+class SimpleCfg:
+    use_profile: bool = True
+    step_start: int = 0
+    step_end: int = 1
+    profile_ranks: list = [0]
+    save_path: str = "./profile"
+
 class Profiler:
-    def __init__(self, config):
+    def __init__(self, config = None):
+        
         # note : if we do not set use_profile, it will be set as None, so that all function will be skip
-        self.config = config
+        self.config = config if config is not None else SimpleCfg()
         self.skip_prof = False
         self.saved = False
         self.prof = None
         self.rank = torch.distributed.get_rank()
         # we need to validate the config before using the profiler
         self._validate()
-        if config.use_profile and self.rank in self.config.profile_ranks:
+        if self.config.use_profile and self.rank in self.config.profile_ranks:
             print(f"[Profiler] Profiler init for rank {self.rank}")
 
             self.prof = torch.profiler.profile(

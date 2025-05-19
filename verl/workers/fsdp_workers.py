@@ -147,7 +147,7 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
             
-        self.prof = Profiler(self.config.profile)
+        self.prof = Profiler()
 
     def _build_model_optimizer(
         self,
