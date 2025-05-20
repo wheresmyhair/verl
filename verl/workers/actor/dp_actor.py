@@ -340,7 +340,8 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
-                print(f"rank {torch.distributed.get_rank()} update_policy epoch {epoch} mini batch {batch_idx}")
+                if torch.distributed.get_rank() == 0:
+                    print(f"update_policy epoch {epoch} mini batch {batch_idx}")
                 # split batch into micro_batches
                 mini_batch = data
                 if has_multi_modal_inputs:
@@ -359,7 +360,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 micro_batch_idx = 0
                 for data in micro_batches:
-                    print(f"rank {torch.distributed.get_rank()} update_policy epoch {epoch} mini batch {batch_idx} micro batch {micro_batch_idx}")
+                    if torch.distributed.get_rank() == 0:
+                        print(f"update_policy epoch {epoch} mini batch {batch_idx} micro batch {micro_batch_idx}")
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
@@ -367,7 +369,8 @@ class DataParallelPPOActor(BasePPOActor):
                         data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
                     responses = data["responses"]
                     response_length = responses.size(1)
-                    print(f"rank {torch.distributed.get_rank()} num samples {responses.size(0)}")
+                    if torch.distributed.get_rank() == 0:
+                        print(f"num samples {responses.size(0)}")
                     attention_mask = data["attention_mask"]
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
@@ -388,7 +391,8 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    print(f"rank {torch.distributed.get_rank()} forward micro batch")
+                    if torch.distributed.get_rank() == 0:
+                        print(f"forward epoch {epoch} mini batch {batch_idx} micro batch {micro_batch_idx}")
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
@@ -426,7 +430,8 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    print(f"rank {torch.distributed.get_rank()} backward micro batch")
+                    if torch.distributed.get_rank() == 0:
+                        print(f"backward epoch {epoch} mini batch {batch_idx} micro batch {micro_batch_idx}")
                     loss.backward()
 
                     data = {
@@ -438,8 +443,9 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
                     
                     micro_batch_idx += 1
-
-                print(f"rank {torch.distributed.get_rank()} update policy mini step")
+                    
+                if torch.distributed.get_rank() == 0:
+                    print(f"update policy epoch {epoch} mini batch {batch_idx}")
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, data)
