@@ -325,6 +325,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+            
+        print(f"[DataParallelPPOActor.update_policy] before split {len(data)=}")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -344,6 +346,8 @@ class DataParallelPPOActor(BasePPOActor):
                     print(f"update_policy epoch {epoch} mini batch {batch_idx}")
                 # split batch into micro_batches
                 mini_batch = data
+                print(f"[DataParallelPPOActor.update_policy] {len(mini_batch)=}")
+                
                 if has_multi_modal_inputs:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu

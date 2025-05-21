@@ -886,6 +886,7 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info={"cur_step": self.global_steps})
+                print(f"[RayPPOTrainer.fit] step {self.global_steps} {len(batch)=}")
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
