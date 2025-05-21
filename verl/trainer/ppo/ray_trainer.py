@@ -460,6 +460,7 @@ class RayPPOTrainer:
 
             collate_fn = default_collate_fn
 
+        print(f"[RayPPOTrainer._create_dataloader] train_dataset: {len(train_dataset)=}")
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
