@@ -103,6 +103,7 @@ class ActorRolloutRefWorker(Worker):
         self.ulysses_device_mesh = None
         self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
         dp = world_size // self.ulysses_sequence_parallel_size
+        print(f"[ActorRolloutRefWorker] {world_size=}, {dp=}, {self.ulysses_sequence_parallel_size=}")
         if self.ulysses_sequence_parallel_size > 1:
             self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
@@ -147,6 +148,14 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
             
+        print("=====Normalized config:")
+        print(f"{self.config.actor.ppo_mini_batch_size=}")
+        print(f"{self.config.actor.ppo_micro_batch_size=}")
+        print(f"{self.config.actor.ppo_micro_batch_size_per_gpu=}")
+        print(f"{self.config.rollout.log_prob_micro_batch_size=}")
+        print(f"{self.config.rollout.log_prob_micro_batch_size_per_gpu=}")
+        print(f"{self.config.ref.log_prob_micro_batch_size=}")
+        print(f"{self.config.ref.log_prob_micro_batch_size_per_gpu=}")
         # self.prof_update_actor = Profiler(name='update_actor')
         # self.prof_log_prob = Profiler(name='log_prob')
         # self.prof_ref_log_prob = Profiler(name='ref_log_prob')
