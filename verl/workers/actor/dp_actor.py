@@ -328,7 +328,7 @@ class DataParallelPPOActor(BasePPOActor):
             
         print(f"[DataParallelPPOActor.update_policy] before split {len(data)=}") # 640
         batch = data.select(batch_keys=select_keys).batch
-        print(f"[DataParallelPPOActor.update_policy] select data {batch.size()=}")
+        print(f"[DataParallelPPOActor.update_policy] select data {batch.size()=}") # 640
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
         # Split to make minibatch iterator for updating the actor
@@ -339,8 +339,9 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
-            print(f"[DataParallelPPOActor.update_policy] dataloader {len(dataloader)=}")
-            print(f"[DataParallelPPOActor.update_policy] dataloader {dataloader[0].size()=}")
+            print(f"{self.config.ppo_mini_batch_size=}")
+            print(f"[DataParallelPPOActor.update_policy] dataloader {len(dataloader)=}") # 4
+            print(f"[DataParallelPPOActor.update_policy] dataloader {dataloader[0].size()=}") # 160
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
