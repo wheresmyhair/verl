@@ -886,7 +886,7 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info={"cur_step": self.global_steps})
-                print(f"[RayPPOTrainer.fit] step {self.global_steps} {len(batch)=}")
+                print(f"[RayPPOTrainer.fit] step {self.global_steps} init {len(batch)=}")
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -913,6 +913,8 @@ class RayPPOTrainer:
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
+                        
+                        print(f"[RayPPOTrainer.fit] step {self.global_steps} gen res {len(gen_batch_output)=}")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
@@ -933,7 +935,9 @@ class RayPPOTrainer:
                     batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    print(f"[RayPPOTrainer.fit] step {self.global_steps} after repeat {len(batch)=}")
                     batch = batch.union(gen_batch_output)
+                    print(f"[RayPPOTrainer.fit] step {self.global_steps} after union {len(batch)=}")
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -941,6 +945,7 @@ class RayPPOTrainer:
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+                        print(f"[RayPPOTrainer.fit] step {self.global_steps} after balance {len(batch)=}")
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -959,6 +964,7 @@ class RayPPOTrainer:
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        print(f"[RayPPOTrainer.fit] step {self.global_steps} old_log_prob {len(old_log_prob)=}")
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -967,12 +973,15 @@ class RayPPOTrainer:
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+                        print(f"[RayPPOTrainer.fit] step {self.global_steps} after old_log_prob {len(batch)=}")
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            print(f"[RayPPOTrainer.fit] step {self.global_steps} ref_log_prob {len(ref_log_prob)=}")
                             batch = batch.union(ref_log_prob)
+                            print(f"[RayPPOTrainer.fit] step {self.global_steps} after ref_log_prob {len(batch)=}")
 
                     # compute values
                     if self.use_critic:
@@ -1011,6 +1020,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                         )
+                        print(f"[RayPPOTrainer.fit] step {self.global_steps} after compute_adv {len(batch)=}")
 
                     # update critic
                     if self.use_critic:

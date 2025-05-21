@@ -568,6 +568,7 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
+        print(f"[ActorRolloutRefWorker] {len(data)=}")
         self.prof_update_actor = Profiler(name=f"update_actor_step_{data.meta_info['cur_step']}")
         self.prof_update_actor.start()
         data = data.to(torch.cuda.current_device())
