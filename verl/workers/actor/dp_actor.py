@@ -326,8 +326,9 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
             
-        print(f"[DataParallelPPOActor.update_policy] before split {len(data)=}")
+        print(f"[DataParallelPPOActor.update_policy] before split {len(data)=}") # 640
         batch = data.select(batch_keys=select_keys).batch
+        print(f"[DataParallelPPOActor.update_policy] select data {batch.size()=}")
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
         # Split to make minibatch iterator for updating the actor
@@ -338,6 +339,8 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
+            print(f"[DataParallelPPOActor.update_policy] dataloader {len(dataloader)=}")
+            print(f"[DataParallelPPOActor.update_policy] dataloader {dataloader[0].size()=}")
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
@@ -346,7 +349,7 @@ class DataParallelPPOActor(BasePPOActor):
                     print(f"update_policy epoch {epoch} mini batch {batch_idx}")
                 # split batch into micro_batches
                 mini_batch = data
-                print(f"[DataParallelPPOActor.update_policy] {len(mini_batch)=}")
+                print(f"[DataParallelPPOActor.update_policy] {len(mini_batch)=}") # 160
                 
                 if has_multi_modal_inputs:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
