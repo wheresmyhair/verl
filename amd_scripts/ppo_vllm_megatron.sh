@@ -71,10 +71,6 @@ YOUR_RUN_NAME=ppo-test
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo --config-path=/root/verl/verl/trainer/config \
     --config-name='ppo_megatron_trainer.yaml' \
-    actor_rollout_ref.actor.strategy=megatron \
-    actor_rollout_ref.ref.strategy=megatron \
-    critic.strategy=megatron \
-    reward_model.strategy=megatron \
     data.train_files=$gsm8k_train_path \
     data.val_files=$gsm8k_test_path \
     data.train_batch_size=256 \
