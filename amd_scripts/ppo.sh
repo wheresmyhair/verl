@@ -18,7 +18,7 @@ math_test_path=$HOME/data/math/test.parquet
 train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
-GPUS_PER_NODE=1
+GPUS_PER_NODE=8
 ENGINE=sglang
 YOUR_PROJECT_NAME=amd-verl
 YOUR_RUN_NAME=ppo-test
