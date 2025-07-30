@@ -70,10 +70,10 @@ YOUR_RUN_NAME=ppo-test
 #     trainer.total_epochs=3 $@
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-    actor_rollout_ref.actor.strategy=fsdp2 \
-    actor_rollout_ref.ref.strategy=fsdp2 \
-    critic.strategy=fsdp2 \
-    reward_model.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=megatron \
+    actor_rollout_ref.ref.strategy=megatron \
+    critic.strategy=megatron \
+    reward_model.strategy=megatron \
     data.train_files=$gsm8k_train_path \
     data.val_files=$gsm8k_test_path \
     data.train_batch_size=256 \
