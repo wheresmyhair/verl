@@ -69,7 +69,8 @@ YOUR_RUN_NAME=ppo-test
 #     trainer.test_freq=5 \
 #     trainer.total_epochs=3 $@
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo --config-path=/root/verl/verl/trainer/config \
+    --config-name='ppo_megatron_trainer.yaml' \
     actor_rollout_ref.actor.strategy=megatron \
     actor_rollout_ref.ref.strategy=megatron \
     critic.strategy=megatron \
