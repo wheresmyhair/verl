@@ -69,7 +69,7 @@ YOUR_RUN_NAME=ppo-test
 #     trainer.test_freq=5 \
 #     trainer.total_epochs=3 $@
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo --config-path=/root/verl/verl/trainer/config \
+PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo --config-path=/root/verl/amd_scripts/config \
     --config-name='ppo_megatron_trainer.yaml' \
     data.train_files=$gsm8k_train_path \
     data.val_files=$gsm8k_test_path \
