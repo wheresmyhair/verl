@@ -1,7 +1,7 @@
 # Discliamer: the model used in the script is only for academic purpose.
 set -x
 
-export HIP_VISIBLE_DEVICES=0
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 
 # Data preparation scripts are available in ``examples/data_preprocess``.
