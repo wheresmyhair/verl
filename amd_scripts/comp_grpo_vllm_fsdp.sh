@@ -56,6 +56,5 @@ python3 -m verl.trainer.main_ppo \
 	trainer.n_gpus_per_node=$GPUS_PER_NODE \
 	trainer.nnodes=1 \
 	trainer.save_freq=-1 \
-	trainer.test_freq=10 \
-	trainer.total_epochs=50 \
-	trainer.max_steps=10 
+	trainer.test_freq=20 \
+	trainer.total_epochs=50
