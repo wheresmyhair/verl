@@ -248,8 +248,8 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: Dict[str, float], n
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
         "perf/throughput": total_num_tokens / (time * n_gpus),
-        "perf/throughput_response_gen": num_response_tokens / (time_gen * n_gpus),
-        "perf/throughput_response_gen_sequences": num_response_tokens / (time_generate_sequences * n_gpus),
+        "perf/throughput_response_gen_phase_total": num_response_tokens / (time_gen * n_gpus),
+        "perf/throughput_response_gen_engine": num_response_tokens / (time_generate_sequences * n_gpus),
     }
 
 
