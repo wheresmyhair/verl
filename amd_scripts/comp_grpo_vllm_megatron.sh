@@ -3,9 +3,8 @@ set -x
 
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
-export HF_HOME=/home/johnny/hf_cache
 
-python3 examples/data_preprocess/gsm8k.py --local_dir ~/data/gsm8k
+python3 examples/data_preprocess/gsm8k.py --local_dir $HOME/data/gsm8k
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
@@ -24,7 +23,7 @@ GPU_MEMORY_UTILIZATION=0.6 #If deepseek, set GPU_MEMORY_UTILIZATION=0.6
 
 YOUR_RUN_NAME=$ENGINE-TP$TP_VALUE-BSZ$INFERENCE_BATCH_SIZE-GMEM$GPU_MEMORY_UTILIZATION
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo --config-path=/root/verl/amd_scripts/config \
+PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo --config-path=$HOME/verl/amd_scripts/config \
     --config-name='ppo_megatron_example.yaml' \
 	algorithm.adv_estimator=grpo \
 	data.train_files=$train_files \
