@@ -16,7 +16,7 @@ docker run --rm -it \
   --security-opt seccomp=unconfined \
   --privileged \
   -v $HOME/.ssh:/root/.ssh \
-  -v $HOME:$HOME \
+  -v $HOME/eric:$HOME \
   --shm-size 128G \
   verl-rocm \
   /bin/bash
