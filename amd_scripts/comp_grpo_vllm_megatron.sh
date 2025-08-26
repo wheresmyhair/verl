@@ -3,9 +3,8 @@ set -x
 
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
-export PYTORCH_ROCM_ARCH="gfx1031"
-export HSA_OVERRIDE_GFX_VERSION=10.3.1
-export ROCM_PATH=/opt/rocm
+export PYTORCH_ROCM_ARCH="gfx950"
+export HSA_OVERRIDE_GFX_VERSION=9.5.0
 
 python3 examples/data_preprocess/gsm8k.py --local_dir $HOME/data/gsm8k
 
