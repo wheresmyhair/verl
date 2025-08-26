@@ -4,6 +4,7 @@ set -x
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 export HCC_AMDGPU_TARGET=gfx950
+export HSA_OVERRIDE_GFX_VERSION=9.5.0
 
 python3 examples/data_preprocess/gsm8k.py --local_dir $HOME/data/gsm8k
 
