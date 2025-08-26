@@ -46,7 +46,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo --config-path=$HOME/verl/amd
 	actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 	actor_rollout_ref.rollout.n=5 \
 	actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
-	actor_rollout_ref.ref.fsdp_config.param_offload=True \
 	algorithm.kl_ctrl.kl_coef=0.001 \
 	trainer.critic_warmup=0 \
 	trainer.logger=['console','wandb'] \
