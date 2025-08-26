@@ -41,6 +41,7 @@ actor_rollout_ref:
       # 'full' will checkpoint the entire transformer layer and 'selective' only checkpoints memory intensive part of attention
       activations_checkpoint_num_layers: null # not used with 'selective'
     trust_remote_code: False
+    use_remove_padding: True
   actor:
     strategy: megatron  # This is for backward-compatibility
     ppo_mini_batch_size: 256
