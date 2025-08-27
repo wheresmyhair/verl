@@ -72,4 +72,4 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
 	global_profiler.tool=torch \
 	global_profiler.steps="[0,1,2,3,5]" \
 	global_profiler.global_tool_config.torch.discrete=True \
-	global_profiler.save_path=$HOME/profile_results \
+	global_profiler.save_path=$HOME/verl_profile \
