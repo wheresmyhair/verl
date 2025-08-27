@@ -89,21 +89,25 @@ class Profiler:
     def check(self):
         return self.prof is not None and self.enable
 
-    def start(self):
+    def start(self, **kwargs):
+        print(f"profiler start kwargs: {kwargs}")
         if self.check():
             print(f"[Profiler] started for rank {self.rank}")
             self.prof.start()
 
-    def step(self):
+    def step(self, **kwargs):
+        print(f"profiler step kwargs: {kwargs}")
         if self.check():
             self.prof.step()
 
-    def stop(self):
+    def stop(self, **kwargs):
+        print(f"profiler stop kwargs: {kwargs}")
         if self.check():
             print(f"[Profiler] stopped for rank {self.rank}")
             self.prof.stop()
 
-    def save(self):
+    def save(self, **kwargs):
+        print(f"profiler save kwargs: {kwargs}")
         if self.prof is not None and not self.saved:
             if not os.path.exists(self.config.save_path):
                 os.makedirs(self.config.save_path)
@@ -113,12 +117,14 @@ class Profiler:
             self.enable = False
             self.saved = True
 
-    def stop_and_save(self):
+    def stop_and_save(self, **kwargs):
+        print(f"profiler stop_and_save kwargs: {kwargs}")
         if self.check():
             self.stop()
             self.save()
 
-    def stop_trace(self):
+    def stop_trace(self, **kwargs):
+        print(f"profiler stop_trace kwargs: {kwargs}")
         if self.check():
             print(f"[Profiler] Trace stopped for rank {self.rank}")
             self.enable = False
