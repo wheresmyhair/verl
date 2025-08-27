@@ -30,7 +30,7 @@ TRAIN_PP=1
 YOUR_PROJECT_NAME=amd-megatron-verl-grpo-qwen-gsm8k
 YOUR_RUN_NAME=$ENGINE-ROTP$ROLLOUT_TP-BSZ$INFERENCE_BATCH_SIZE-GMEM$GPU_MEMORY_UTILIZATION
 
-python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer'
+python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
 	algorithm.adv_estimator=grpo \
 	data.train_files=$train_files \
 	data.val_files=$test_files \
