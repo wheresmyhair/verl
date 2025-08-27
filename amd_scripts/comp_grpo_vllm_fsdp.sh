@@ -4,6 +4,8 @@ set -x
 export PYTHONPATH=/opt/rocprofiler-systems/lib/python/site-packages:${PYTHONPATH}
 export ROCPROFSYS_PROFILE=ON
 export ROCPROFSYS_TRACE=ON
+export ROCPROFSYS_USE_PID=OFF
+export ROCPROFSYS_TIME_OUTPUT=ON
 export ROCPROFSYS_OUTPUT_PATH=~/verl_profile
 
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
