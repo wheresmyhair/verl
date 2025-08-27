@@ -24,7 +24,7 @@ ENGINE=vllm
 INFERENCE_BATCH_SIZE=40
 GPU_MEMORY_UTILIZATION=0.6
 
-TRAIN_TP=2
+TRAIN_TP=1
 TRAIN_PP=1
 
 YOUR_PROJECT_NAME=amd-megatron-verl-grpo-qwen-gsm8k
@@ -49,9 +49,12 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
 	actor_rollout_ref.actor.profile.profile_ranks="[0,1,2,3,4,5,6,7]" \
 	actor_rollout_ref.actor.profile.step_start=0 \
 	actor_rollout_ref.actor.profile.step_end=9 \
-	actor_rollout_ref.actor.profile.save_path=$HOME/verl_profile \
+	actor_rollout_ref.actor.profile.save_path=$HOME/verl_profile/traintp$TRAIN_TP \
 	actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$TRAIN_TP \
 	actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=$TRAIN_PP \
+	actor_rollout_ref.actor.megatron.param_offload=True \
+	actor_rollout_ref.actor.megatron.grad_offload=True \
+	actor_rollout_ref.actor.megatron.optimizer_offload=True \
 	actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
 	actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
 	actor_rollout_ref.rollout.name=$ENGINE \
