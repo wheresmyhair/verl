@@ -17,8 +17,7 @@ sudo docker run --rm -it \
   --privileged \
   -v $HOME/.ssh:/root/.ssh \
   -v $HOME:$HOME \
-  -e HOME=$HOME/eric \
-  -e HF_HOME=$HOME/eric/hf_cache \
+  -e HF_HOME=$HOME/hf_cache \
   --shm-size 128G \
   verl-rocm \
   /bin/bash
