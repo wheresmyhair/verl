@@ -62,4 +62,4 @@ python3 -m rocprofsys -- verl/trainer/main_ppo.py \
 	trainer.nnodes=1 \
 	trainer.save_freq=-1 \
 	trainer.test_freq=20 \
-	trainer.total_epochs=50
+	trainer.total_epochs=1
