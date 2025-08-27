@@ -15,7 +15,7 @@ train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
 # setup model
-MODEL_PATH="Qwen/Qwen2-7B-Instruct"
+MODEL_PATH="/root/hf_cache/hub/models--Qwen--Qwen2-7B-Instruct/snapshots/f2826a00ceef68f0f2b946d945ecc0477ce4450c"
 
 # setup environment
 GPUS_PER_NODE=8
