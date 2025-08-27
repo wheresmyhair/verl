@@ -1,6 +1,11 @@
 # Discliamer: the model used in the script is only for academic purpose.
 set -x
 
+export PYTHONPATH=/opt/rocprofiler-systems/lib/python/site-packages:${PYTHONPATH}
+export ROCPROFSYS_PROFILE=ON
+export ROCPROFSYS_TRACE=ON
+export ROCPROFSYS_OUTPUT_PATH=~/verl_profile
+
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 
@@ -23,7 +28,7 @@ GPU_MEMORY_UTILIZATION=0.6 #If deepseek, set GPU_MEMORY_UTILIZATION=0.6
 
 YOUR_RUN_NAME=grpo-qwen-gsm8k-$ENGINE-TP$TP_VALUE-BSZ$INFERENCE_BATCH_SIZE-GMEM$GPU_MEMORY_UTILIZATION
 
-python3 -m verl.trainer.main_ppo \
+python3 -m rocprofsys -m verl.trainer.main_ppo \
 	algorithm.adv_estimator=grpo \
 	data.train_files=$train_files \
 	data.val_files=$test_files \

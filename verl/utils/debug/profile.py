@@ -22,7 +22,7 @@ import torch.distributed
 
 @dataclass
 class SimpleCfg:
-    use_profile: bool = True
+    use_profile: bool = False
     step_start: int = 0
     step_end: int = 5
     profile_ranks: list = field(default_factory=lambda: [0])
