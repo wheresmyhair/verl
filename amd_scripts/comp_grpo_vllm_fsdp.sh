@@ -28,7 +28,7 @@ GPU_MEMORY_UTILIZATION=0.6 #If deepseek, set GPU_MEMORY_UTILIZATION=0.6
 
 YOUR_RUN_NAME=grpo-qwen-gsm8k-$ENGINE-TP$TP_VALUE-BSZ$INFERENCE_BATCH_SIZE-GMEM$GPU_MEMORY_UTILIZATION
 
-python3 -m rocprofsys -m verl.trainer.main_ppo \
+python3 -m rocprofsys -- verl/trainer/trainer/main_ppo.py \
 	algorithm.adv_estimator=grpo \
 	data.train_files=$train_files \
 	data.val_files=$test_files \
