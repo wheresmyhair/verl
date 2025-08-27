@@ -20,7 +20,8 @@ import torch
 import torch.distributed
 
 from ..memory_utils import MemorySnapshotSampler, enable_memory_visualize
-from .config import ProfilerConfig, TorchMemoryToolConfig, TorchProfilerToolConfig
+from .config import (ProfilerConfig, TorchMemoryToolConfig,
+                     TorchProfilerToolConfig)
 
 
 class Profiler:
@@ -56,7 +57,7 @@ class Profiler:
         self.rank = torch.distributed.get_rank()
         # we need to validate the config before using the profiler
         self._validate()
-        if self.rank in self.config.profile_ranks:
+        if self.rank in self.config.ranks:
             print(f"[Profiler] Profiler init for rank {self.rank}")
 
             self.prof = torch.profiler.profile(
@@ -76,9 +77,9 @@ class Profiler:
 
     def _validate(self):
         if self.enable:
-            if self.config.profile_ranks is None:
+            if self.config.ranks is None:
                 print("[WARNING] Profile ranks is not set, default to rank 0")
-                self.config.profile_ranks = [0]
+                self.config.ranks = [0]
             assert self.tool_config.step_start >= 0, "[ERROR] Profile step start must be greater than 0"
             assert self.tool_config.step_end >= 0, "[ERROR] Profile step end must be greater than 0"
             assert self.tool_config.step_start < self.tool_config.step_end, (
