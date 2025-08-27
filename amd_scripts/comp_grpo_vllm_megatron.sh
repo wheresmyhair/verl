@@ -48,7 +48,6 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
 	actor_rollout_ref.actor.profiler.all_ranks=True \
 	actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$TRAIN_TP \
 	actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=$TRAIN_PP \
-	actor_rollout_ref.model.enable_gradient_checkpointing=True \
 	actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
 	actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
 	actor_rollout_ref.rollout.name=$ENGINE \
@@ -70,5 +69,4 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
 	trainer.total_training_steps=10 \
 	global_profiler.tool=torch \
 	global_profiler.steps="[0,1,2,3,5]" \
-	global_profiler.global_tool_config.torch.discrete=True \
 	global_profiler.save_path=$HOME/verl_profile \
