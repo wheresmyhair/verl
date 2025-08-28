@@ -186,6 +186,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             else {}
         ),
         # response length
+        "response_length/total": torch.sum(response_length).detach().item(),
         "response_length/mean": torch.mean(response_length).detach().item(),
         "response_length/max": torch.max(response_length).detach().item(),
         "response_length/min": torch.min(response_length).detach().item(),
@@ -202,6 +203,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         # Fraction of samples whose response length is zero
         "response/aborted_ratio": aborted_ratio,
         # prompt length
+        "prompt_length/total": torch.sum(prompt_length).detach().item(),
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
@@ -292,6 +294,11 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     """
     total_num_tokens = sum(batch.meta_info["global_token_num"])
     time = timing_raw["step"]
+    
+    response_info = _compute_response_info(batch)
+    num_response_tokens = torch.sum(response_info["response_length"]).item()
+    time_generate_sequences = timing_raw["generate_sequences"]
+    time_gen = timing_raw["gen"]
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
     # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
@@ -299,6 +306,8 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
         "perf/throughput": total_num_tokens / (time * n_gpus),
+        "perf/throughput_response_gen_phase_total": num_response_tokens / (time_gen * n_gpus),
+        "perf/throughput_response_gen_engine": num_response_tokens / (time_generate_sequences * n_gpus),
     }
 
 

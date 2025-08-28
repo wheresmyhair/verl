@@ -1,0 +1,7 @@
+bash amd_scripts/comp_grpo_vllm_fsdp.sh
+bash amd_scripts/comp_grpo_vllm_megatron.sh
+bash amd_scripts/comp_grpo_vllm_megatron2.sh
+bash amd_scripts/comp_grpo_vllm_megatron4.sh
+bash amd_scripts/comp_grpo_vllm_megatron_pp.sh
+bash amd_scripts/comp_grpo_vllm_megatron_pp2.sh
+bash amd_scripts/comp_grpo_vllm_megatron_pp3.sh
