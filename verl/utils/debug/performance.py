@@ -114,6 +114,7 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     with Timer(name=name, logger=None) as timer:
         yield
     if name not in timing_raw:
+        print(f"Adding {name} to timing_raw")
         timing_raw[name] = 0
     timing_raw[name] += timer.last
 
