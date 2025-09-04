@@ -601,6 +601,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
         estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+        metrics["perf/flops_single/actor"] = estimated_flops
+        metrics["perf/flops_promised"] = promised_flops
+        metrics["perf/flops_epoch"] = estimated_flops * self.config.actor.ppo_epochs
         metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
         metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
         metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
