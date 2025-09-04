@@ -11,7 +11,6 @@ git checkout amd-0.4.1
 sudo docker run --rm -it \
   --device /dev/dri \
   --device /dev/kfd \
-  -p 8265:8265 \
   --cap-add SYS_PTRACE \
   --security-opt seccomp=unconfined \
   --privileged \
