@@ -1,15 +1,15 @@
 # Discliamer: the model used in the script is only for academic purpose.
 set -x
 
-export HIP_VISIBLE_DEVICES=2,3
+export HIP_VISIBLE_DEVICES=0,1,2,3
 export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 export PYTHONUNBUFFERED=1
 
 # setup environment
-GPUS_PER_NODE=2
+GPUS_PER_NODE=4
 ROLLOUT_TP=1
 TRAIN_TP=1
-TRAIN_PP=2
+TRAIN_PP=4
 ENGINE=vllm
 INFERENCE_BATCH_SIZE=40
 GPU_MEMORY_UTILIZATION=0.4
