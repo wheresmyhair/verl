@@ -88,8 +88,8 @@ if __name__ == "__main__":
 
     train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
     test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
-    train_dataset = train_dataset.select(range(4)) # rlpipe modification for testing
-    test_dataset = test_dataset.select(range(14)) # rlpipe modification for testing
+    train_dataset = train_dataset.select(range(1024))
+    test_dataset = test_dataset.select(range(14))
 
     hdfs_dir = args.hdfs_dir
     local_save_dir = args.local_dir

@@ -208,10 +208,12 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        print(f"[RANK {torch.distributed.get_rank()}] init vllm inference engine") # rlpipe modification
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
             tensor_parallel_size=tensor_parallel_size,
+            # tensor_parallel_size=1, # rlpipe modification
             distributed_executor_backend="external_launcher",
             dtype=config.dtype,
             enforce_eager=config.enforce_eager,
@@ -231,6 +233,8 @@ class vLLMRollout(BaseRollout):
             **self.lora_kwargs,
             **engine_kwargs,
         )
+        print(f"tensor_parallel_size: {self.inference_engine.llm_engine.vllm_config.parallel_config.tensor_parallel_size}") # rlpipe modification
+        
 
         kwargs = dict(
             n=1,
@@ -372,10 +376,12 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
+            response_lengths = [] # rlpipe modification
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
+                    response_lengths.append(len(response_ids)) # rlpipe modification
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
@@ -394,6 +400,7 @@ class vLLMRollout(BaseRollout):
             seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
+        non_tensor_batch["response_lengths"] = np.array(response_lengths, dtype=object) # rlpipe modification
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
         if position_ids.dim() == 3:  # qwen2vl mrope (batch size, 4, seq len)

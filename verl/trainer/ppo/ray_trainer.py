@@ -60,6 +60,139 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.addon import save_log_by_rank
+
+from typing import List, Dict
+import heapq
+
+
+class SampleLengthBalancer:
+    """
+    Balances LLM requests across workers to minimize maximum worker load.
+    
+    Uses a greedy algorithm that assigns each request to the worker with
+    the current minimum load (Longest Processing Time First heuristic).
+    """
+    
+    def __init__(self, num_workers: int):
+        """
+        Initialize the load balancer.
+        
+        Args:
+            num_workers: Number of available LLM workers
+        """
+        if num_workers <= 0:
+            raise ValueError("Number of workers must be positive")
+        self.num_workers = num_workers
+    
+    def balance(self, response_lengths: List[int], return_length: bool = False) -> Dict[int, List[tuple]]:
+        """
+        Balance requests across workers to minimize maximum load.
+        
+        Args:
+            response_lengths: List of estimated response lengths for each request
+            
+        Returns:
+            Dictionary mapping worker_id -> list of (request_index, response_length)
+            
+        Example:
+            >>> balancer = LLMLoadBalancer(num_workers=3)
+            >>> result = balancer.balance([100, 200, 150, 50, 300])
+            >>> # Returns assignments like:
+            >>> # {0: [(4, 300)], 1: [(1, 200), (3, 50)], 2: [(0, 100), (2, 150)]}
+        """
+        if not response_lengths:
+            return {i: [] for i in range(self.num_workers)}
+        
+        # Sort requests by length (descending) for better balance
+        indexed_lengths = [(length, idx) for idx, length in enumerate(response_lengths)]
+        indexed_lengths.sort(reverse=True)
+        
+        # Min-heap: (current_load, worker_id, assigned_requests)
+        workers = [(0, i, []) for i in range(self.num_workers)]
+        heapq.heapify(workers)
+        
+        # Assign each request to the worker with minimum current load
+        for length, request_idx in indexed_lengths:
+            current_load, worker_id, assigned = heapq.heappop(workers)
+            assigned.append((request_idx, length))
+            heapq.heappush(workers, (current_load + length, worker_id, assigned))
+        
+        # Convert to dictionary format
+        result = {}
+        for load, worker_id, assigned in workers:
+            result[worker_id] = assigned
+            
+        self.__print_assignment(result)
+        
+        if not return_length:
+            # {0: [4], 1: [1, 3], 2: [0, 2]}
+            result = {worker_id: [request_idx for request_idx, _ in assigned] for worker_id, assigned in result.items()}
+        
+        return result
+    
+    def __get_balance_stats(self, assignment: Dict[int, List[tuple]]) -> Dict[str, float]:
+        """
+        Get statistics about the balance quality.
+        
+        Args:
+            assignment: Result from balance() method
+            
+        Returns:
+            Dictionary with 'max_load', 'min_load', 'avg_load', and 'imbalance_ratio'
+        """
+        loads = [sum(length for _, length in tasks) for tasks in assignment.values()]
+        
+        if not any(loads):
+            return {
+                'max_load': 0,
+                'min_load': 0,
+                'avg_load': 0,
+                'imbalance_ratio': 0
+            }
+        
+        max_load = max(loads)
+        min_load = min(loads)
+        avg_load = sum(loads) / len(loads)
+        imbalance_ratio = (max_load - min_load) / max_load if max_load > 0 else 0
+        
+        return {
+            'max_load': max_load,
+            'min_load': min_load,
+            'avg_load': avg_load,
+            'imbalance_ratio': imbalance_ratio
+        }
+    
+    def __print_assignment(self, assignment: Dict[int, List[tuple]]):
+        """
+        Print a human-readable view of the worker assignments.
+        
+        Args:
+            assignment: Result from balance() method
+        """
+        print(f"\n{'='*60}")
+        print(f"Load Balancing Assignment ({self.num_workers} workers)")
+        print(f"{'='*60}")
+        
+        for worker_id in sorted(assignment.keys()):
+            tasks = assignment[worker_id]
+            total_load = sum(length for _, length in tasks)
+            print(f"\nWorker {worker_id} (Total Load: {total_load}):")
+            
+            if tasks:
+                for request_idx, length in sorted(tasks):
+                    print(f"  - Request {request_idx}: {length} tokens")
+            else:
+                print("  - No tasks assigned")
+        
+        stats = self.__get_balance_stats(assignment)
+        print(f"\n{'='*60}")
+        print("Balance Statistics:")
+        print(f"  Max Load: {stats['max_load']}")
+        print(f"  Min Load: {stats['min_load']}")
+        print(f"  Avg Load: {stats['avg_load']:.2f}")
+        print(f"  Imbalance Ratio: {stats['imbalance_ratio']:.2%}")
+        print(f"{'='*60}\n")
 
 
 @dataclass
@@ -1027,6 +1160,9 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        sample_lengths = {k: [[] for _ in range(self.config.trainer.total_epochs)] for k in range(len(self.train_dataset))} # rlpipe modification
+        # {sample_idx: [[lengths_ep0_n0, lengths_ep0_n1, ...], [lengths_ep1_n0, lengths_ep1_n1, ...], ...]}
+        response_length_balance = True # rlpipe modification
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1039,6 +1175,8 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                
+                print(f"Epoch: {epoch}, Step: {self.global_steps}, Batch: {batch}") # rlpipe modification
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
@@ -1058,7 +1196,48 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
+                            
+                            print(f"{gen_batch_output=}")
+                                
+                            if epoch != 0 and response_length_balance: # rlpipe modification
+                                # if epoch == 0, samples are being evenly distributed to dp ranks
+                                # if epoch != 0, samples are being balanced based on response lengths in the previous epoch
+                                # example: index_mapping = {0: [0, ], 1: [1,2,3]} # -> the 0th sample IN THIS GEN_BATCH_OUTPUT is mapped to dp rank 0, vise versa.
+                                # 1. get lengths in this batch
+                                sample_idx_this_batch = gen_batch_output.non_tensor_batch["index"]
+                                print(f"sample_idx_this_batch: {sample_idx_this_batch}")
+                                estimated_lengths_this_batch = []
+                                for sample_idx in sample_idx_this_batch:
+                                    # since we drop last incomplete batch, there's chance that there's no length for this sample in the previous epoch
+                                    # try to find the last length for this sample
+                                    length_found = False
+                                    for length in sample_lengths[sample_idx][:epoch][::-1]:
+                                        if length:
+                                            estimated_lengths_this_batch.append(np.mean(length))
+                                            length_found = True
+                                            break
+                                    if not length_found:
+                                        estimated_lengths_this_batch.append(1024)
+                                print(f"estimated_lengths_this_batch: {estimated_lengths_this_batch}")
+                                # 2. rebalance
+                                balancer = SampleLengthBalancer(num_workers=self.actor_rollout_wg.world_size)
+                                index_mapping = balancer.balance(estimated_lengths_this_batch)
+                                print(f"index_mapping: {index_mapping}")
+                                balanced_num_samples_per_worker = len(estimated_lengths_this_batch) // self.actor_rollout_wg.world_size
+                                for k,v in index_mapping.items():
+                                    print(
+                                        f"index mapping rank: {k}, num_samples: "
+                                        f"balanced: {len(v)}; "
+                                        f"original: {sum(estimated_lengths_this_batch[k*balanced_num_samples_per_worker:(k+1)*balanced_num_samples_per_worker])}"
+                                    )
+                                gen_batch_output.meta_info['dp_index_mapping'] = index_mapping
+                                
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            
+                            print(f"after generate_sequences: {gen_batch_output=}")
+                            for idx, sample_idx in enumerate(gen_batch_output.non_tensor_batch["index"]): # the global sample index across all datasets.
+                                sample_lengths[sample_idx][epoch].append(gen_batch_output.non_tensor_batch["response_lengths"][idx])
+                            print(f"sample_lengths: {sample_lengths}")
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 

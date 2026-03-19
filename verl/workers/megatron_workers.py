@@ -36,7 +36,7 @@ from megatron.core import parallel_state as mpu
 
 from verl import DataProto
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register, DYNAMIC_INDEX_DISPATCH
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
@@ -74,6 +74,7 @@ from verl.workers.config import HFModelConfig, McoreCriticConfig, RolloutConfig
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
 from verl.workers.rollout import get_rollout_class
+from verl.utils.addon import save_log_by_rank
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -656,12 +657,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         return output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    # @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @register(dispatch_mode=DYNAMIC_INDEX_DISPATCH)
     @GPUMemoryLogger(role="generate_sequences", logger=logger)
     @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
         prompts = prompts.to(get_device_name())
+        save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] {prompts=}")
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
             if self.generation_config is not None
@@ -681,7 +684,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
+            start_time = datetime.datetime.now()
+            save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] rollout start, {start_time=}")
             output = self.rollout.generate_sequences(prompts=prompts)
+            end_time = datetime.datetime.now()
+            save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] rollout end, {end_time=}")
+            save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] rollout time, {end_time - start_time=}")
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
