@@ -127,3 +127,5 @@ log
 outputs
 .history
 .jsonl
+log_rank_*.txt
+log.txt
