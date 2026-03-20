@@ -72,18 +72,23 @@ class InferenceStage:
         attention_mask: torch.Tensor,
         num_micro_batches: int,
         position_ids: Optional[torch.Tensor] = None,
+        use_remove_padding: bool = False,
     ):
         """Pre-chunk the full batch into micro-batches."""
         if position_ids is None:
             position_ids = attention_mask.long().cumsum(dim=-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
 
-        self._micro_input_ids = list(input_ids.chunk(num_micro_batches, dim=0))
-        self._micro_attention_mask = list(attention_mask.chunk(num_micro_batches, dim=0))
-        self._micro_position_ids = list(position_ids.chunk(num_micro_batches, dim=0))
-
-        # Also set batch data on the underlying PipelineStage
-        self.stage.set_batch_data(input_ids, attention_mask, num_micro_batches, position_ids)
+        # Delegate to underlying PipelineStage (handles rmpad internally)
+        self.stage.set_batch_data(
+            input_ids, attention_mask, num_micro_batches, position_ids,
+            use_remove_padding=use_remove_padding,
+        )
+        # Mirror the stage's processed micro-batches
+        self._micro_input_ids = self.stage._micro_input_ids
+        self._micro_attention_mask = self.stage._micro_attention_mask
+        self._micro_position_ids = self.stage._micro_position_ids
+        self._micro_nnz = self.stage._micro_nnz
 
     def clear_batch_data(self):
         """Free micro-batch data after a step."""

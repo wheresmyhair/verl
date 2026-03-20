@@ -29,6 +29,12 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from .partitioner import compute_layer_assignment
 
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input
+    _FLASH_PADDING_AVAILABLE = True
+except ImportError:
+    _FLASH_PADDING_AVAILABLE = False
+
 
 def _prune_model_inplace(
     model: nn.Module,
@@ -248,9 +254,15 @@ class PipelineStage(nn.Module):
         attention_mask: torch.Tensor,
         num_micro_batches: int,
         position_ids: Optional[torch.Tensor] = None,
+        use_remove_padding: bool = False,
     ):
         """
         Pre-chunk the full batch into micro-batches and store locally.
+
+        When use_remove_padding=True, each micro-batch is unpadded:
+        [micro_B, S] -> [1, total_nnz] with position_ids encoding
+        sequence boundaries (reset to 0 at each sequence start).
+        Flash Attention varlen handles the rest.
         """
         B = input_ids.size(0)
         if B % num_micro_batches != 0:
@@ -262,9 +274,42 @@ class PipelineStage(nn.Module):
             position_ids = attention_mask.long().cumsum(dim=-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
 
-        self._micro_input_ids = list(input_ids.chunk(num_micro_batches, dim=0))
-        self._micro_attention_mask = list(attention_mask.chunk(num_micro_batches, dim=0))
-        self._micro_position_ids = list(position_ids.chunk(num_micro_batches, dim=0))
+        micro_ids = list(input_ids.chunk(num_micro_batches, dim=0))
+        micro_mask = list(attention_mask.chunk(num_micro_batches, dim=0))
+        micro_pos = list(position_ids.chunk(num_micro_batches, dim=0))
+
+        self._use_remove_padding = use_remove_padding
+        self._micro_nnz: List[int] = []  # total_nnz per micro-batch (for comm shapes)
+
+        if use_remove_padding and _FLASH_PADDING_AVAILABLE:
+            # Unpad each micro-batch: [micro_B, S] -> [1, total_nnz]
+            self._micro_input_ids = []
+            self._micro_attention_mask = []  # None for each micro-batch
+            self._micro_position_ids = []
+            for i in range(num_micro_batches):
+                ids_rmpad, indices, cu_seqlens, max_seqlen, *_ = unpad_input(
+                    micro_ids[i].unsqueeze(-1), micro_mask[i]
+                )
+                ids_rmpad = ids_rmpad.squeeze(-1)  # [total_nnz]
+                total_nnz = ids_rmpad.size(0)
+                self._micro_nnz.append(total_nnz)
+
+                # Build position_ids with resets: [0,1,..,L1-1, 0,1,..,L2-1, ...]
+                seq_lens = cu_seqlens.diff().tolist()
+                pos_list = [torch.arange(sl, device=input_ids.device) for sl in seq_lens]
+                pos_rmpad = torch.cat(pos_list)  # [total_nnz]
+
+                # Store as [1, total_nnz] (model expects batch dim)
+                self._micro_input_ids.append(ids_rmpad.unsqueeze(0))
+                self._micro_attention_mask.append(None)  # varlen doesn't use mask
+                self._micro_position_ids.append(pos_rmpad.unsqueeze(0))
+        else:
+            self._micro_input_ids = micro_ids
+            self._micro_attention_mask = micro_mask
+            self._micro_position_ids = micro_pos
+            for i in range(num_micro_batches):
+                self._micro_nnz.append(micro_ids[i].size(0) * micro_ids[i].size(1))
+
         self._stash.clear()
 
     def clear_batch_data(self):
@@ -414,6 +459,8 @@ class PipelineStage(nn.Module):
         is_last = pp_rank == pp_size - 1
 
         # 1. Instantiate model on meta device (zero memory)
+        #    Use flash_attention_2 for varlen support (remove-padding).
+        config._attn_implementation = "flash_attention_2"
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
 
@@ -444,6 +491,17 @@ class PipelineStage(nn.Module):
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
+
+        # 8. Apply monkey patch for remove-padding (varlen Flash Attention).
+        # This replaces _flash_attention_forward so that when attention_mask=None
+        # and position_ids encodes sequence boundaries (resets to 0), Flash
+        # Attention uses flash_attn_varlen_func. No padding waste.
+        try:
+            from verl.models.transformers.monkey_patch import apply_monkey_patch
+            apply_monkey_patch(model, use_remove_padding=True)
+        except Exception as e:
+            print(f"[PP rank {pp_rank}] Warning: monkey patch failed ({e}), "
+                  f"remove_padding will be unavailable")
 
         t_load = time.time() - t0
 

@@ -129,6 +129,7 @@ def _pp_forward_log_prob(
     calculate_entropy: bool = True,
     pp_pair_groups: dict = None,
     use_fused_loss: bool = True,
+    use_remove_padding: bool = False,
 ):
     """
     Run forward-only PP across all micro-batches and collect log probs
@@ -137,15 +138,18 @@ def _pp_forward_log_prob(
     When use_fused_loss=True, the last stage returns hidden states and
     applies FusedLinearForPPO to avoid materializing [B, S, V] logits.
 
+    When use_remove_padding=True, padding tokens are removed before forward,
+    reducing compute and memory proportional to actual token count.
+
     Returns (full_log_probs, full_entropy) on last stage, (None, None) elsewhere.
-    Both are [B, S-1] shaped.
+    Both are [B, S-1] shaped (padded back if rmpad was used).
     """
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
     B, S = input_ids.shape
     micro_B = B // M
 
-    stage.set_batch_data(input_ids, attention_mask, M)
+    stage.set_batch_data(input_ids, attention_mask, M, use_remove_padding=use_remove_padding)
 
     all_log_probs = []
     all_entropys = []
@@ -157,8 +161,12 @@ def _pp_forward_log_prob(
             if stage.is_first:
                 output = stage.forward_step(mb, return_hidden=(use_fused_loss and stage.is_last))
             else:
-                act_shape = (micro_B, S, hidden_size)
-                # Gloo requires CPU tensors for P2P
+                # Activation shape: [1, total_nnz, H] if rmpad, else [micro_B, S, H]
+                nnz = stage._micro_nnz[mb]
+                if use_remove_padding:
+                    act_shape = (1, nnz, hidden_size)
+                else:
+                    act_shape = (micro_B, S, hidden_size)
                 hidden_cpu = torch.empty(act_shape, dtype=stage.dtype, device="cpu")
                 pair_group = pp_pair_groups[pp_rank - 1]
                 dist.recv(hidden_cpu, src=pp_rank - 1, group=pair_group)
@@ -166,9 +174,8 @@ def _pp_forward_log_prob(
                 output = stage.forward_step(mb, hidden, return_hidden=(use_fused_loss and stage.is_last))
 
             if stage.is_last:
-                micro_ids = input_ids.chunk(M, dim=0)[mb]
+                micro_ids = stage._micro_input_ids[mb]  # [1, nnz] or [micro_B, S]
                 if use_fused_loss:
-                    # output is hidden_states [B, S, H] — no logits materialized
                     rolled_labels = torch.roll(micro_ids, shifts=-1, dims=-1)
                     lp, ent = fused.forward(
                         hidden_states=output,
@@ -176,11 +183,10 @@ def _pp_forward_log_prob(
                         input_ids=rolled_labels,
                         temperature=1.0,
                     )
-                    all_log_probs.append(lp[:, :-1])  # [B, S-1]
+                    all_log_probs.append(lp[:, :-1])
                     if calculate_entropy:
                         all_entropys.append(ent[:, :-1])
                 else:
-                    # output is logits [B, S, V]
                     all_log_probs.append(log_probs_from_logits(output, micro_ids))
                     if calculate_entropy:
                         all_entropys.append(entropy_from_logits(output))
@@ -192,8 +198,49 @@ def _pp_forward_log_prob(
     stage.clear_batch_data()
 
     if stage.is_last:
-        full_log_probs = torch.cat(all_log_probs, dim=0)
-        full_entropy = torch.cat(all_entropys, dim=0) if calculate_entropy else None
+        if use_remove_padding:
+            # Concatenate unpadded log_probs from all micro-batches.
+            # Each is [1, nnz_i-1]. We need to pad back to [micro_B, S-1]
+            # per micro-batch, then cat to [B, S-1] for the caller.
+            from flash_attn.bert_padding import pad_input, unpad_input
+            padded_lps = []
+            padded_ents = []
+            micro_masks = list(attention_mask.chunk(M, dim=0))
+            for i, lp_rmpad in enumerate(all_log_probs):
+                mb_mask = micro_masks[i]
+                mb_B = mb_mask.size(0)
+                # Unpad the mask to get indices for padding back
+                _, indices, cu_seqlens, *_ = unpad_input(
+                    mb_mask.unsqueeze(-1), mb_mask
+                )
+                # lp_rmpad is [1, nnz-1] — we need to pad to [mb_B, S-1]
+                # The log_probs correspond to positions 0..nnz-2 (shifted).
+                # For padding back, we truncate indices to match nnz-1 length.
+                lp_flat = lp_rmpad.squeeze(0)  # [nnz-1]
+                # Build indices for the shifted (S-1) dimension
+                seq_lens = cu_seqlens.diff().tolist()
+                shifted_indices = []
+                offset = 0
+                for sl in seq_lens:
+                    shifted_indices.append(indices[offset:offset+sl-1])
+                    offset += sl
+                shifted_idx = torch.cat(shifted_indices) if shifted_indices else indices[:0]
+                lp_padded = torch.zeros(mb_B, S - 1, device=device, dtype=lp_flat.dtype)
+                lp_padded_flat = pad_input(
+                    lp_flat.unsqueeze(-1), shifted_idx, mb_B, S - 1
+                ).squeeze(-1)
+                padded_lps.append(lp_padded_flat)
+                if calculate_entropy and i < len(all_entropys):
+                    ent_flat = all_entropys[i].squeeze(0)
+                    ent_padded = pad_input(
+                        ent_flat.unsqueeze(-1), shifted_idx, mb_B, S - 1
+                    ).squeeze(-1)
+                    padded_ents.append(ent_padded)
+            full_log_probs = torch.cat(padded_lps, dim=0)
+            full_entropy = torch.cat(padded_ents, dim=0) if calculate_entropy else None
+        else:
+            full_log_probs = torch.cat(all_log_probs, dim=0)
+            full_entropy = torch.cat(all_entropys, dim=0) if calculate_entropy else None
         return full_log_probs, full_entropy
     return None, None
 
@@ -277,6 +324,7 @@ class ActorRolloutRefWorker(Worker):
             self._ref_is_offload_param = self.config.ref.get("param_offload", False)
 
         self._num_micro_batches: int = self.config.actor.get("num_micro_batches", 4)
+        self._use_remove_padding: bool = self.config.model.get("use_remove_padding", True)
 
         # ── Will be set in init_model ──
         self.train_stage: Optional[PipelineStage] = None
@@ -665,6 +713,7 @@ class ActorRolloutRefWorker(Worker):
                 device=self.device,
                 calculate_entropy=True,
                 pp_pair_groups=self._pp_pair_groups,
+                use_remove_padding=self._use_remove_padding,
             )
 
         self.train_stage.train()
@@ -737,6 +786,7 @@ class ActorRolloutRefWorker(Worker):
                 device=self.device,
                 calculate_entropy=False,
                 pp_pair_groups=self._pp_pair_groups,
+                use_remove_padding=self._use_remove_padding,
             )
 
         if self.ref_stage.is_last:
@@ -804,7 +854,10 @@ class ActorRolloutRefWorker(Worker):
         micro_B = B // M
 
         with simple_timer("update_policy", timing_update):
-            self.train_stage.set_batch_data(input_ids, attention_mask, M)
+            self.train_stage.set_batch_data(
+                input_ids, attention_mask, M,
+                use_remove_padding=self._use_remove_padding,
+            )
             self.optimizer.zero_grad()
 
             # Pre-chunk loss inputs for last stage
@@ -846,7 +899,11 @@ class ActorRolloutRefWorker(Worker):
                 if op.op == "forward":
                     input_hidden = None
                     if not self.train_stage.is_first:
-                        act_shape = (micro_B, S, self.hidden_size)
+                        nnz = self.train_stage._micro_nnz[mb]
+                        if self._use_remove_padding:
+                            act_shape = (1, nnz, self.hidden_size)
+                        else:
+                            act_shape = (micro_B, S, self.hidden_size)
                         input_hidden = _p2p_recv(act_shape, self.pp_rank - 1, self.train_stage.dtype)
                         input_hidden.requires_grad_(True)
 
@@ -883,7 +940,11 @@ class ActorRolloutRefWorker(Worker):
                             handle = _p2p_send(input_grad, self.pp_rank - 1)
                             pending_sends.append(handle)
                     else:
-                        act_shape = (micro_B, S, self.hidden_size)
+                        nnz = self.train_stage._micro_nnz[mb]
+                        if self._use_remove_padding:
+                            act_shape = (1, nnz, self.hidden_size)
+                        else:
+                            act_shape = (micro_B, S, self.hidden_size)
                         grad = _p2p_recv(act_shape, self.pp_rank + 1, self.train_stage.dtype)
                         input_grad = self.train_stage.backward_step(mb, grad_output=grad)
 
@@ -974,8 +1035,14 @@ class ActorRolloutRefWorker(Worker):
 
         with simple_timer("fused_update_policy", timing_fused):
             # Set batch data on BOTH stages
-            self.train_stage.set_batch_data(input_ids, attention_mask, M)
-            self.infer_stage.set_batch_data(input_ids, attention_mask, M)
+            self.train_stage.set_batch_data(
+                input_ids, attention_mask, M,
+                use_remove_padding=self._use_remove_padding,
+            )
+            self.infer_stage.set_batch_data(
+                input_ids, attention_mask, M,
+                use_remove_padding=self._use_remove_padding,
+            )
 
             # Pre-chunk loss inputs for last training stage
             is_last_train = self.train_stage.is_last
@@ -1010,7 +1077,8 @@ class ActorRolloutRefWorker(Worker):
                 if op.op == "train_forward":
                     input_hidden = None
                     if not self.train_stage.is_first:
-                        act_shape = (micro_B, S, self.hidden_size)
+                        nnz = self.train_stage._micro_nnz[mb]
+                        act_shape = (1, nnz, self.hidden_size) if self._use_remove_padding else (micro_B, S, self.hidden_size)
                         input_hidden = recv_activation(
                             shape=act_shape,
                             src_rank=self.pp_rank - 1,
@@ -1078,7 +1146,8 @@ class ActorRolloutRefWorker(Worker):
                             )
                             pending_sends.append(handle)
                     else:
-                        act_shape = (micro_B, S, self.hidden_size)
+                        nnz = self.train_stage._micro_nnz[mb]
+                        act_shape = (1, nnz, self.hidden_size) if self._use_remove_padding else (micro_B, S, self.hidden_size)
                         grad = recv_grad(
                             shape=act_shape,
                             src_rank=self.pp_rank + 1,
@@ -1099,7 +1168,8 @@ class ActorRolloutRefWorker(Worker):
                 elif op.op == "infer_forward":
                     input_hidden = None
                     if not self.infer_stage.is_first_infer:
-                        act_shape = (micro_B, S, self.hidden_size)
+                        nnz = self.infer_stage._micro_nnz[mb]
+                        act_shape = (1, nnz, self.hidden_size) if self._use_remove_padding else (micro_B, S, self.hidden_size)
                         input_hidden = recv_infer_activation(
                             shape=act_shape,
                             src_rank=self.pp_rank + 1,

@@ -38,7 +38,8 @@ def full_model_output():
     """Run full model forward once and cache the result."""
     config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, torch_dtype=torch.bfloat16, trust_remote_code=True
+        MODEL_PATH, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        attn_implementation="flash_attention_2",
     ).to(DEVICE).eval()
 
     B, S = 2, 64
