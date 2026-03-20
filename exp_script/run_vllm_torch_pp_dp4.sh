@@ -31,12 +31,12 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	algorithm.adv_estimator=grpo \
 	data.train_files=$train_files \
 	data.val_files=$test_files \
-	data.train_batch_size=1024 \
-	data.max_prompt_length=512 \
-	data.max_response_length=2560 \
+	data.train_batch_size=16 \
+	data.max_prompt_length=256 \
+	data.max_response_length=256 \
 	actor_rollout_ref.model.path=$MODEL_PATH \
 	actor_rollout_ref.actor.optim.lr=1e-6 \
-	actor_rollout_ref.actor.ppo_mini_batch_size=128 \
+	actor_rollout_ref.actor.ppo_mini_batch_size=16 \
 	actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
 	actor_rollout_ref.actor.use_kl_loss=True \
 	actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -50,7 +50,8 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
 	actor_rollout_ref.rollout.name=$ENGINE \
 	actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
-	actor_rollout_ref.rollout.n=5 \
+	actor_rollout_ref.rollout.n=1 \
+	actor_rollout_ref.nccl_timeout=60 \
 	actor_rollout_ref.rollout.enable_chunked_prefill=False \
 	actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
 	algorithm.kl_ctrl.kl_coef=0.001 \

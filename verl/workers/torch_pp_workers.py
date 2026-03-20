@@ -32,6 +32,7 @@ from verl.single_controller.base.decorator import (
 )
 from verl.utils.device import (
     get_device_name,
+    get_nccl_backend,
     get_torch_device,
     set_expandable_segments,
 )
@@ -125,6 +126,7 @@ def _pp_forward_log_prob(
     pp_rank: int,
     device: torch.device,
     calculate_entropy: bool = True,
+    pp_pair_groups: dict = None,
 ):
     """
     Run forward-only PP across all micro-batches and collect log probs
@@ -147,13 +149,11 @@ def _pp_forward_log_prob(
                 output = stage.forward_step(mb)
             else:
                 act_shape = (micro_B, S, hidden_size)
-                hidden = recv_activation(
-                    shape=act_shape,
-                    src_rank=pp_rank - 1,
-                    micro_batch_id=mb,
-                    device=device,
-                    dtype=stage.dtype,
-                )
+                # Gloo requires CPU tensors for P2P
+                hidden_cpu = torch.empty(act_shape, dtype=stage.dtype, device="cpu")
+                pair_group = pp_pair_groups[pp_rank - 1]
+                dist.recv(hidden_cpu, src=pp_rank - 1, group=pair_group)
+                hidden = hidden_cpu.to(device)
                 output = stage.forward_step(mb, hidden)
 
             if stage.is_last:
@@ -163,12 +163,9 @@ def _pp_forward_log_prob(
                 if calculate_entropy:
                     all_entropys.append(entropy_from_logits(logits))
             else:
-                handle = send_activation(
-                    output.detach(),
-                    dst_rank=pp_rank + 1,
-                    micro_batch_id=mb,
-                )
-                handle.wait()
+                out_t = output.detach().contiguous().cpu()
+                pair_group = pp_pair_groups[pp_rank]
+                dist.send(out_t, dst=pp_rank + 1, group=pair_group)
 
     stage.clear_batch_data()
 
@@ -220,7 +217,7 @@ class ActorRolloutRefWorker(Worker):
             set_numa_affinity()
             rank = int(os.environ["LOCAL_RANK"])
             torch.distributed.init_process_group(
-                backend="nccl",
+                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
@@ -326,6 +323,43 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
     # ==================================================================
+    # NCCL P2P warmup
+    # ==================================================================
+
+    def _create_pp_pair_groups(self):
+        """Create per-pair gloo groups for PP communication.
+
+        Uses gloo backend to avoid NCCL's lazy communicator init deadlocks.
+        Tensors are staged through CPU for send/recv, which adds overhead
+        but is reliable. NCCL P2P on pair groups deadlocks because NCCL's
+        sub-communicator init requires rank 0 to distribute ncclUniqueId
+        via the TCPStore, and the sequential P2P pattern prevents this.
+        """
+        from .torch_pp.comm import get_pp_pair_groups, set_pp_pair_groups
+
+        existing = get_pp_pair_groups()
+        if existing is not None:
+            self._pp_pair_groups = existing
+            return  # Already created (e.g. init_model called twice for actor+ref)
+
+        rank = self.pp_rank
+        world_size = self.pp_size
+
+        pair_groups = {}
+
+        # Create a gloo group for each adjacent pair (world-wide collective)
+        for i in range(world_size - 1):
+            pair_group = dist.new_group(ranks=[i, i + 1], backend="gloo")
+            if rank == i or rank == i + 1:
+                pair_groups[i] = pair_group
+
+        set_pp_pair_groups(pair_groups)
+        self._pp_pair_groups = pair_groups
+
+        if rank == 0:
+            print(f"[PP] Created {world_size - 1} gloo pair groups for PP communication", flush=True)
+
+    # ==================================================================
     # init_model
     # ==================================================================
 
@@ -351,6 +385,11 @@ class ActorRolloutRefWorker(Worker):
         self.local_path = local_path
 
         log_gpu_memory_usage("Before init actor model and optimizer", logger=logger)
+
+        # ── Create PP pair groups (must be before vLLM init) ──
+        # new_group is a world-wide collective, so it must be called when
+        # all ranks are synchronized (ONE_TO_ALL dispatch in init_model).
+        self._create_pp_pair_groups()
 
         # ── Training stage + optimizer ──
         if self._is_actor or self._is_rollout:
@@ -563,6 +602,9 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         timing_log_prob = {}
 
+        # Pair groups were created in init_model (before vLLM init)
+        assert self._pp_pair_groups is not None, "PP pair groups not initialized"
+
         with simple_timer("load_inference", timing_log_prob):
             if self._is_offload_param:
                 _load_module(self.train_stage, self.device)
@@ -575,6 +617,8 @@ class ActorRolloutRefWorker(Worker):
         attention_mask = data.batch["attention_mask"]
         B, S = input_ids.shape
 
+        print(f"[PP rank {self.pp_rank}] compute_log_prob B={B}, S={S}, is_first={self.train_stage.is_first}, is_last={self.train_stage.is_last}", flush=True)
+
         # Determine micro-batch count
         mbs_per_gpu = self.config.rollout.get("log_prob_micro_batch_size_per_gpu", None)
         if mbs_per_gpu and mbs_per_gpu > 0:
@@ -583,6 +627,8 @@ class ActorRolloutRefWorker(Worker):
             M = self._num_micro_batches
         while B % M != 0 and M > 1:
             M -= 1
+
+        print(f"[PP rank {self.pp_rank}] compute_log_prob M={M}, about to call _pp_forward_log_prob", flush=True)
 
         with simple_timer("compute_log_prob", timing_log_prob):
             full_log_probs, full_entropy = _pp_forward_log_prob(
@@ -594,6 +640,7 @@ class ActorRolloutRefWorker(Worker):
                 pp_rank=self.pp_rank,
                 device=self.device,
                 calculate_entropy=True,
+                pp_pair_groups=self._pp_pair_groups,
             )
 
         self.train_stage.train()
@@ -630,6 +677,9 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_ref
         timing_ref = {}
 
+        # Pair groups were created in init_model (before vLLM init)
+        assert self._pp_pair_groups is not None, "PP pair groups not initialized"
+
         with simple_timer("load_ref", timing_ref):
             if self._ref_is_offload_param:
                 _load_module(self.ref_stage, self.device)
@@ -659,6 +709,7 @@ class ActorRolloutRefWorker(Worker):
                 pp_rank=self.pp_rank,
                 device=self.device,
                 calculate_entropy=False,
+                pp_pair_groups=self._pp_pair_groups,
             )
 
         if self.ref_stage.is_last:
@@ -689,6 +740,9 @@ class ActorRolloutRefWorker(Worker):
     def update_actor(self, data: DataProto):
         assert self._is_actor
         timing_update = {}
+
+        # Pair groups were created in init_model (before vLLM init)
+        assert self._pp_pair_groups is not None, "PP pair groups not initialized"
 
         with simple_timer("load_training", timing_update):
             if self._is_offload_param:
@@ -737,6 +791,25 @@ class ActorRolloutRefWorker(Worker):
             all_stats = []
             pending_sends = []
 
+            # Keep refs to CPU send buffers to prevent GC before isend completes
+            _send_bufs = []
+
+            def _p2p_send(tensor, dst_rank):
+                """Non-blocking send via gloo pair group (CPU-staged)."""
+                t = tensor.detach().contiguous().cpu()
+                _send_bufs.append(t)  # prevent GC
+                pair_idx = min(self.pp_rank, dst_rank)
+                group = self._pp_pair_groups[pair_idx]
+                return dist.isend(t, dst=dst_rank, group=group)
+
+            def _p2p_recv(shape, src_rank, dtype):
+                """Recv via gloo pair group (CPU-staged)."""
+                buf = torch.empty(shape, dtype=dtype, device="cpu")
+                pair_idx = min(self.pp_rank, src_rank)
+                group = self._pp_pair_groups[pair_idx]
+                dist.recv(buf, src=src_rank, group=group)
+                return buf.to(self.device)
+
             for op in schedule:
                 mb = op.micro_batch_id
 
@@ -744,13 +817,8 @@ class ActorRolloutRefWorker(Worker):
                     input_hidden = None
                     if not self.train_stage.is_first:
                         act_shape = (micro_B, S, self.hidden_size)
-                        input_hidden = recv_activation(
-                            shape=act_shape,
-                            src_rank=self.pp_rank - 1,
-                            micro_batch_id=mb,
-                            device=self.device,
-                            dtype=self.train_stage.dtype,
-                        )
+                        input_hidden = _p2p_recv(act_shape, self.pp_rank - 1, self.train_stage.dtype)
+                        input_hidden.requires_grad_(True)
 
                     output = self.train_stage.forward_step(mb, input_hidden)
 
@@ -771,40 +839,22 @@ class ActorRolloutRefWorker(Worker):
                         scaled_loss.backward()
                         all_stats.append(stats)
                     else:
-                        handle = send_activation(
-                            output.detach(),
-                            dst_rank=self.pp_rank + 1,
-                            micro_batch_id=mb,
-                        )
+                        handle = _p2p_send(output.detach(), self.pp_rank + 1)
                         pending_sends.append(handle)
 
                 elif op.op == "backward":
                     if self.train_stage.is_last:
                         input_grad = self.train_stage.backward_step(mb, grad_output=None)
                         if input_grad is not None:
-                            handle = send_grad(
-                                input_grad,
-                                dst_rank=self.pp_rank - 1,
-                                micro_batch_id=mb,
-                            )
+                            handle = _p2p_send(input_grad, self.pp_rank - 1)
                             pending_sends.append(handle)
                     else:
                         act_shape = (micro_B, S, self.hidden_size)
-                        grad = recv_grad(
-                            shape=act_shape,
-                            src_rank=self.pp_rank + 1,
-                            micro_batch_id=mb,
-                            device=self.device,
-                            dtype=self.train_stage.dtype,
-                        )
+                        grad = _p2p_recv(act_shape, self.pp_rank + 1, self.train_stage.dtype)
                         input_grad = self.train_stage.backward_step(mb, grad_output=grad)
 
                         if not self.train_stage.is_first and input_grad is not None:
-                            handle = send_grad(
-                                input_grad,
-                                dst_rank=self.pp_rank - 1,
-                                micro_batch_id=mb,
-                            )
+                            handle = _p2p_send(input_grad, self.pp_rank - 1)
                             pending_sends.append(handle)
 
             for handle in pending_sends:

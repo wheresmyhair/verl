@@ -44,9 +44,10 @@ def _prune_model_inplace(
     kept_layers = all_layers[start_layer:end_layer]
     inner.layers = nn.ModuleList(kept_layers)
 
-    # Update config so HF's _update_causal_mask() sees the correct
-    # layer count.
-    model.config.num_hidden_layers = end_layer - start_layer
+    # Do NOT change model.config.num_hidden_layers — some models (e.g. Qwen3)
+    # use it internally for per-layer attention patterns (max_window_layers).
+    # Changing it causes NaN. The causal mask works correctly with the
+    # original value since it depends on seq_len, not layer count.
 
     if not is_last:
         if hasattr(inner, "norm"):
@@ -55,6 +56,24 @@ def _prune_model_inplace(
             model.lm_head = nn.Identity()
 
     del all_layers
+
+
+def _reinit_non_persistent_buffers(model: nn.Module, config):
+    """
+    Reinitialize non-persistent buffers (e.g. rotary embeddings) that are
+    computed during __init__ but NOT stored in state_dict / safetensors.
+
+    After from_config(meta) + to_empty(), these buffers are all-zeros,
+    which causes NaN in attention.
+    """
+    for name, module in model.named_modules():
+        # Handle rotary embedding (used by Qwen, Llama, Mistral, etc.)
+        if hasattr(module, "inv_freq") and hasattr(module, "rope_init_fn"):
+            # Use the current device of inv_freq; rope_init_fn creates float32 by default
+            inv_freq, attention_scaling = module.rope_init_fn(module.config, device=module.inv_freq.device)
+            module.inv_freq = inv_freq
+            module.original_inv_freq = inv_freq
+            module.attention_scaling = attention_scaling
 
 
 def _load_partial_weights(
@@ -73,6 +92,17 @@ def _load_partial_weights(
     original global-indexed weights and remaps them to local indices.
     """
     from safetensors import safe_open
+
+    # Resolve HuggingFace hub model IDs to local paths
+    if not os.path.isdir(model_path):
+        try:
+            from huggingface_hub import snapshot_download
+            model_path = snapshot_download(model_path)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Model path '{model_path}' is not a local directory and "
+                f"could not be downloaded from HuggingFace Hub: {e}"
+            )
 
     is_first = pp_rank == 0
     is_last = pp_rank == pp_size - 1
@@ -359,8 +389,15 @@ class PipelineStage(nn.Module):
         # 4. Selectively load weights from safetensors
         _load_partial_weights(model, model_path, start, end, pp_rank, pp_size)
 
-        # 5. Move to device
+        # 5. Move to device (before reinit — .to(dtype) would cast float32
+        # buffers like inv_freq to bf16, losing precision)
         model.to(device=device, dtype=dtype)
+
+        # 6. Reinitialize non-persistent buffers (e.g. rotary embeddings)
+        # that are computed during __init__ but not stored in safetensors.
+        # Must happen AFTER .to() so the buffers are created in float32
+        # on the correct device (rope_init_fn creates inv_freq as float32).
+        _reinit_non_persistent_buffers(model, config)
 
         t_load = time.time() - t0
 

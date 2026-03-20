@@ -47,6 +47,36 @@ def _old_log_probs_tag(micro_batch_id: int) -> int:
 
 
 # -----------------------------------------------------------------------
+# Global default PP group — set via set_pp_group() at init time
+# -----------------------------------------------------------------------
+
+_PP_GROUP: Optional[dist.ProcessGroup] = None
+_PP_PAIR_GROUPS: Optional[dict] = None
+
+
+def set_pp_group(group: dist.ProcessGroup):
+    """Set the default process group for all PP communication."""
+    global _PP_GROUP
+    _PP_GROUP = group
+
+
+def get_pp_group() -> Optional[dist.ProcessGroup]:
+    """Get the default PP process group."""
+    return _PP_GROUP
+
+
+def set_pp_pair_groups(groups: dict):
+    """Set the per-pair PP process groups."""
+    global _PP_PAIR_GROUPS
+    _PP_PAIR_GROUPS = groups
+
+
+def get_pp_pair_groups() -> Optional[dict]:
+    """Get the per-pair PP process groups."""
+    return _PP_PAIR_GROUPS
+
+
+# -----------------------------------------------------------------------
 # Internal helpers — NCCL native, no shape headers
 # -----------------------------------------------------------------------
 

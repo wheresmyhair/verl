@@ -2,9 +2,10 @@
 defaults:
   - actor@actor_rollout_ref.actor: torch_pp_actor
   - data@data: legacy_data
-  - ref@actor_rollout_ref.ref: megatron_ref
+  - ref@actor_rollout_ref.ref: dp_ref
   - rollout@actor_rollout_ref.rollout: rollout
-  - reward_model@reward_model: megatron_reward_model
+  - critic@critic: dp_critic
+  - reward_model@reward_model: dp_reward_model
   - _self_
 
 actor_rollout_ref:
