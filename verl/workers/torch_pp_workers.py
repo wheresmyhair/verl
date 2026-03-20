@@ -665,6 +665,9 @@ class ActorRolloutRefWorker(Worker):
         timing_log_prob = reduce_timing(timing_log_prob)
         if torch.distributed.get_rank() == 0:
             print(f"[PROFILING] compute_log_prob timing: {timing_log_prob}")
+        output.meta_info["timing"] = {
+            f"compute_log_prob/{k}": v for k, v in timing_log_prob.items()
+        }
         return output
 
     # ==================================================================
@@ -729,6 +732,9 @@ class ActorRolloutRefWorker(Worker):
         timing_ref = reduce_timing(timing_ref)
         if torch.distributed.get_rank() == 0:
             print(f"[PROFILING] compute_ref_log_prob timing: {timing_ref}")
+        output.meta_info["timing"] = {
+            f"compute_ref_log_prob/{k}": v for k, v in timing_ref.items()
+        }
         return output
 
     # ==================================================================

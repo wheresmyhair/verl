@@ -17,6 +17,17 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from verl.utils.torch_functional import (
+    logprobs_from_logits_v2 as _logprobs_from_logits_v2,
+    entropy_from_logits_with_chunking as _entropy_from_logits_chunked,
+)
+
+try:
+    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss as _flash_cross_entropy
+    _FLASH_CE_AVAILABLE = True
+except ImportError:
+    _FLASH_CE_AVAILABLE = False
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Helpers
@@ -30,6 +41,10 @@ def log_probs_from_logits(
     """
     Per-token log probs (shifted for causal LM).
 
+    Uses memory-efficient implementation: flash-attn cross_entropy if
+    available, otherwise logsumexp trick (avoids materializing full
+    softmax). Falls back to row-by-row processing for bf16 stability.
+
     Args:
         logits: [B, S, V]
         labels: [B, S]
@@ -39,16 +54,40 @@ def log_probs_from_logits(
     """
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
-    log_probs = F.log_softmax(shift_logits, dim=-1)
-    return log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+    # Flash-attn Triton cross_entropy is fastest but requires CUDA tensors
+    if _FLASH_CE_AVAILABLE and shift_logits.is_cuda:
+        flat_logits = shift_logits.reshape(-1, shift_logits.size(-1))
+        flat_labels = shift_labels.reshape(-1)
+        output = _flash_cross_entropy(flat_logits, flat_labels, inplace_backward=True)
+        assert isinstance(output, tuple), (
+            "please make sure flash-attn>=2.4.3 where cross_entropy_loss returns Tuple[losses, z_losses]."
+        )
+        return -output[0].view(shift_logits.shape[:-1])
+    # Fallback: logsumexp trick (float32) or row-by-row log_softmax (bf16)
+    return _logprobs_from_logits_v2(shift_logits, shift_labels)
 
 
-def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    """Per-token entropy (shifted). [B, S, V] -> [B, S-1]."""
+def entropy_from_logits(
+    logits: torch.Tensor,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Per-token entropy (shifted), computed in chunks.
+
+    Chunks along the flattened (B*S) dimension to cap peak memory from
+    softmax/logsumexp intermediates over the vocab dimension.
+
+    Args:
+        logits: [B, S, V]
+        chunk_size: number of token rows per chunk (default 1024)
+
+    Returns:
+        [B, S-1]
+    """
     shift_logits = logits[:, :-1, :].contiguous()
-    log_probs = F.log_softmax(shift_logits, dim=-1)
-    probs = F.softmax(shift_logits, dim=-1)
-    return -(probs * log_probs).sum(dim=-1)
+    B, S_minus_1, V = shift_logits.shape
+    flat = shift_logits.view(-1, V)  # [B*(S-1), V]
+    ent_flat = _entropy_from_logits_chunked(flat, chunk_size=chunk_size)
+    return ent_flat.view(B, S_minus_1)
 
 
 def gather_response_log_probs(

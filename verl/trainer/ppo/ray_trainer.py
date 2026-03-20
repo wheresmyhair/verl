@@ -1309,6 +1309,8 @@ class RayPPOTrainer:
                         # Standard path: recompute old_log_probs separately
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            if "timing" in old_log_prob.meta_info:
+                                timing_raw.update(old_log_prob.meta_info.pop("timing"))
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1331,6 +1333,8 @@ class RayPPOTrainer:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            if "timing" in ref_log_prob.meta_info:
+                                timing_raw.update(ref_log_prob.meta_info.pop("timing"))
                             batch = batch.union(ref_log_prob)
 
                     # compute values
