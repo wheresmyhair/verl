@@ -13,14 +13,13 @@ GPU_MEMORY_UTILIZATION=0.7
 YOUR_PROJECT_NAME=verl-rollout-optim
 YOUR_RUN_NAME=dp4
 
-# reuse data from megatron run (same data dir)
+# setup data
+# keep this since we may change the gsm8k_all.py file
+python3 examples/data_preprocess/gsm8k_all.py --local_dir $HOME/data/gsm8k-$YOUR_RUN_NAME
+
 gsm8k_train_path=$HOME/data/gsm8k-$YOUR_RUN_NAME/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k-$YOUR_RUN_NAME/test.parquet
 
-# if data doesn't exist yet, preprocess it
-if [ ! -f "$gsm8k_train_path" ]; then
-    python3 examples/data_preprocess/gsm8k_all.py --local_dir $HOME/data/gsm8k-$YOUR_RUN_NAME
-fi
 
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
@@ -56,9 +55,9 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
 	algorithm.kl_ctrl.kl_coef=0.001 \
 	trainer.critic_warmup=0 \
-	trainer.logger=['console'] \
+	trainer.logger=['console','wandb'] \
 	trainer.project_name=$YOUR_PROJECT_NAME \
-	trainer.experiment_name=torch_pp_dp4 \
+	trainer.experiment_name=$YOUR_RUN_NAME \
 	trainer.n_gpus_per_node=$GPUS_PER_NODE \
 	trainer.nnodes=1 \
 	trainer.save_freq=-1 \
