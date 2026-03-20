@@ -560,49 +560,62 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        _timing = {}
         aggressive_empty_cache(force_sync=True)
 
-        if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
-            log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
+        with simple_timer("rollout_mode/load_actor_to_gpu", _timing):
+            if self._is_offload_param:
+                load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
+                log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
 
-        if self.bridge is not None:
-            per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
-        else:
-            per_tensor_param = per_tensor_generator(
-                self.actor.actor_module,
-                self.actor_model_config,
-                self.weight_converter,
-                self.tf_config,
-                self.layer_name_mapping,
-            )
+        with simple_timer("rollout_mode/export_weights", _timing):
+            if self.bridge is not None:
+                per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
+            else:
+                per_tensor_param = per_tensor_generator(
+                    self.actor.actor_module,
+                    self.actor_model_config,
+                    self.weight_converter,
+                    self.tf_config,
+                    self.layer_name_mapping,
+                )
 
         set_expandable_segments(False)
 
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
-        await self.rollout.update_weights(per_tensor_param)
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor.actor_module)
+        with simple_timer("rollout_mode/resume_weights", _timing):
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["weights"])
+        with simple_timer("rollout_mode/update_weights", _timing):
+            await self.rollout.update_weights(per_tensor_param)
+        with simple_timer("rollout_mode/offload_actor", _timing):
+            if self._is_offload_param:
+                offload_megatron_model_to_cpu(self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
+        with simple_timer("rollout_mode/resume_kv_cache", _timing):
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["kv_cache"])
 
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
 
+        if torch.distributed.get_rank() == 0:
+            print(f"[PROFILING] rollout_mode sub-phases: {_timing}")
+
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
-        if self.config.rollout.free_cache_engine:
-            log_gpu_memory_usage("Before rollout offload", logger=logger)
-            await self.rollout.release()
-            log_gpu_memory_usage("After rollout offload", logger=logger)
+        _timing = {}
+        with simple_timer("trainer_mode/release_rollout", _timing):
+            if self.config.rollout.free_cache_engine:
+                log_gpu_memory_usage("Before rollout offload", logger=logger)
+                await self.rollout.release()
+                log_gpu_memory_usage("After rollout offload", logger=logger)
 
-        for model in self.actor.actor_module:
-            model.train()
-        # add empty cache after each compute
-        aggressive_empty_cache(force_sync=True)
+        with simple_timer("trainer_mode/set_train_and_cleanup", _timing):
+            for model in self.actor.actor_module:
+                model.train()
+            # add empty cache after each compute
+            aggressive_empty_cache(force_sync=True)
 
         # FIXME(@wuxibin): megatron+sglang failed with `expandable_segments:True` in ci,
         # can't reproduce it in dev environment, temporary disable it.
@@ -614,17 +627,22 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
 
+        if torch.distributed.get_rank() == 0:
+            print(f"[PROFILING] trainer_mode sub-phases: {_timing}")
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red")
     def update_actor(self, data: DataProto):
         assert self._is_actor
-        if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor_module)
-            log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            load_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        timing_update = {}
+        with simple_timer("load_training", timing_update):
+            if self._is_offload_param:
+                load_megatron_model_to_gpu(self.actor_module)
+                log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                load_megatron_optimizer(self.actor_optimizer)
+                log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
@@ -647,14 +665,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        with simple_timer("unload_training", timing_update):
+            if self._is_offload_param:
+                offload_megatron_model_to_cpu(self.actor_module)
+                log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                offload_megatron_optimizer(self.actor_optimizer)
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         aggressive_empty_cache(force_sync=True)
+        timing_update = reduce_timing(timing_update)
+        if torch.distributed.get_rank() == 0:
+            print(f"[PROFILING] update_actor timing: {timing_update}")
         return output
 
     # @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -680,7 +702,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
+            with simple_timer("load_rollout", timing_generate):
+                loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
@@ -692,7 +715,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] rollout time, {end_time - start_time=}")
 
         if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
+            with simple_timer("unload_rollout", timing_generate):
+                loop.run_until_complete(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks
@@ -709,6 +733,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             }
         )
         output.meta_info["timing"] = timing_generate
+        if torch.distributed.get_rank() == 0:
+            print(f"[PROFILING] generate_sequences timing: {timing_generate}")
         output = output.to("cpu")
         # clear kv cache
         aggressive_empty_cache(force_sync=True)
@@ -719,21 +745,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive")
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
-        if self._ref_is_offload_param:
-            load_megatron_model_to_gpu(self.ref_module, load_grad=False)
-            log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob", logger=logger)
+        timing_ref = {}
+        with simple_timer("load_ref", timing_ref):
+            if self._ref_is_offload_param:
+                load_megatron_model_to_gpu(self.ref_module, load_grad=False)
+                log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob", logger=logger)
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        with simple_timer("compute_ref_log_prob", timing_ref):
+            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
-        if self._ref_is_offload_param:
-            offload_megatron_model_to_cpu(self.ref_module)
-            log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob", logger=logger)
+        with simple_timer("unload_ref", timing_ref):
+            if self._ref_is_offload_param:
+                offload_megatron_model_to_cpu(self.ref_module)
+                log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
+        timing_ref = reduce_timing(timing_ref)
+        if torch.distributed.get_rank() == 0:
+            print(f"[PROFILING] compute_ref_log_prob timing: {timing_ref}")
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -741,25 +774,32 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue")
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
-        if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-            log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
+        timing_log_prob = {}
+        with simple_timer("load_inference", timing_log_prob):
+            if self._is_offload_param:
+                load_megatron_model_to_gpu(self.actor_module, load_grad=False)
+                log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        with simple_timer("compute_log_prob", timing_log_prob):
+            output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
             tensors={"old_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},
         )
         output = output.to("cpu")
         # clear kv cache
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
+        with simple_timer("unload_inference", timing_log_prob):
+            if self._is_offload_param:
+                offload_megatron_model_to_cpu(self.actor_module)
+                log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
+        timing_log_prob = reduce_timing(timing_log_prob)
+        if torch.distributed.get_rank() == 0:
+            print(f"[PROFILING] compute_log_prob timing: {timing_log_prob}")
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

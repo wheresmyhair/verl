@@ -136,6 +136,12 @@ class TaskRunner:
             )
             ray_worker_group_cls = RayWorkerGroup
 
+        elif config.actor_rollout_ref.actor.strategy == "torch_naive_pp":
+            from verl.workers.torch_pp_workers import ActorRolloutRefWorker
+
+            actor_rollout_cls = ActorRolloutRefWorker
+            ray_worker_group_cls = RayWorkerGroup
+
         else:
             raise NotImplementedError
 
