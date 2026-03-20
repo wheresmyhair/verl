@@ -13,6 +13,11 @@ actor_rollout_ref:
 
   nccl_timeout: 600
 
+  # Profiling
+  enable_pp_trace: false
+  enable_response_profiling: true
+  profiling_save_dir: null
+
   model:
     path: ~/models/Qwen3-0.6B
     custom_chat_template: null

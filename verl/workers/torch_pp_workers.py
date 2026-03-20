@@ -63,6 +63,8 @@ from .torch_pp.loss import (
     gather_response_log_probs,
     log_probs_from_logits,
 )
+from .torch_pp.pp_trace import PPTracer
+from .torch_pp.response_length_profiler import ResponseLengthProfiler
 from .torch_pp.comm import (
     recv_activation,
     recv_grad,
@@ -338,6 +340,14 @@ class ActorRolloutRefWorker(Worker):
         self.local_path: Optional[str] = None
         self.dtype = torch.bfloat16
 
+        # ── Profiling tools ──
+        self._pp_tracer: Optional[PPTracer] = None
+        self._response_profiler: Optional[ResponseLengthProfiler] = None
+        self._enable_pp_trace = self.config.get("enable_pp_trace", False)
+        self._enable_response_profiling = self.config.get("enable_response_profiling", True)
+        self._profiling_save_dir = self.config.get("profiling_save_dir", "/tmp/pp_profiling")
+        self._step_counter = 0
+
     # ==================================================================
     # Build rollout
     # ==================================================================
@@ -453,6 +463,18 @@ class ActorRolloutRefWorker(Worker):
         hf_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         self.hidden_size = hf_config.hidden_size
         self.local_path = local_path
+
+        # Initialize profiling tools
+        self._pp_tracer = PPTracer(
+            pp_rank=self.pp_rank, pp_size=self.pp_size,
+            enabled=self._enable_pp_trace,
+            save_dir=os.path.join(self._profiling_save_dir, "traces"),
+        )
+        max_resp_len = self.config.rollout.get("response_length", 7168)
+        max_seq_len = self.config.rollout.get("prompt_length", 1024) + max_resp_len
+        self._response_profiler = ResponseLengthProfiler(
+            max_response_len=max_resp_len, max_seq_len=max_seq_len,
+        )
 
         log_gpu_memory_usage("Before init actor model and optimizer", logger=logger)
 
@@ -631,18 +653,30 @@ class ActorRolloutRefWorker(Worker):
             _offload_optimizer(self.optimizer)
 
         timing_generate = {}
+
+        # begin_step is called here (earliest phase), but step counter
+        # is incremented in update_actor where end_step saves the trace.
+        # Use a tentative step number; update_actor will finalize it.
+        self._pp_tracer.begin_step(self._step_counter + 1)
+
         if self._is_actor:
-            with simple_timer("load_rollout", timing_generate):
-                loop = get_event_loop()
-                loop.run_until_complete(self.rollout_mode())
+            with self._pp_tracer.phase("load_rollout"):
+                with simple_timer("load_rollout", timing_generate):
+                    loop = get_event_loop()
+                    loop.run_until_complete(self.rollout_mode())
+            self._pp_tracer.record_hbm("after_load_rollout")
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
-        with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+        with self._pp_tracer.phase("rollout"):
+            with simple_timer("generate_sequences", timing_generate):
+                output = self.rollout.generate_sequences(prompts=prompts)
+        self._pp_tracer.record_hbm("after_rollout")
 
         if self._is_actor:
-            with simple_timer("unload_rollout", timing_generate):
-                loop.run_until_complete(self.trainer_mode())
+            with self._pp_tracer.phase("unload_rollout"):
+                with simple_timer("unload_rollout", timing_generate):
+                    loop.run_until_complete(self.trainer_mode())
+            self._pp_tracer.record_hbm("after_unload_rollout")
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # Average timing across all ranks (same as megatron)
@@ -660,6 +694,41 @@ class ActorRolloutRefWorker(Worker):
         output.meta_info["timing"] = timing_generate
         if torch.distributed.get_rank() == 0:
             print(f"[PROFILING] generate_sequences timing: {timing_generate}")
+
+        # ── Response length profiling ──
+        # NOTE: Don't put per-worker metrics into output.meta_info — DP workers
+        # see different samples, causing conflicts in DataProto.concat().
+        # Save to disk only; wandb gets response_length stats from the trainer.
+        if self._enable_response_profiling and self._response_profiler is not None:
+            self._response_profiler.reset()
+            resp_lens = None
+            if "response_mask" in output.batch:
+                resp_lens = output.batch["response_mask"].sum(dim=-1)
+            elif "response_lengths" in output.non_tensor_batch:
+                resp_lens = output.non_tensor_batch["response_lengths"]
+            elif "attention_mask" in output.batch:
+                resp_lens = output.batch["attention_mask"].sum(dim=-1)
+
+            if resp_lens is not None:
+                prompt_ids = output.non_tensor_batch.get("index", None)
+                prompt_lens = None
+                if "attention_mask" in output.batch and "response_mask" in output.batch:
+                    prompt_lens = (
+                        output.batch["attention_mask"].sum(dim=-1)
+                        - output.batch["response_mask"].sum(dim=-1)
+                    )
+                self._response_profiler.record(resp_lens, prompt_ids, prompt_lens)
+                # Save per-step raw data for offline analysis (each DP rank saves its shard)
+                self._response_profiler.save_step(
+                    os.path.join(self._profiling_save_dir, "response_lengths"),
+                    self._step_counter + 1,
+                )
+                if torch.distributed.get_rank() == 0:
+                    resp_metrics = self._response_profiler.compute_metrics()
+                    print(f"[PROFILING] response_length: mean={resp_metrics.get('response_length/mean', 0):.0f}, "
+                          f"p90={resp_metrics.get('response_length/p90', 0):.0f}, "
+                          f"waste={resp_metrics.get('response_length/padding_waste', 0):.1%}")
+
         output = output.to("cpu")
         aggressive_empty_cache(force_sync=True)
         return output
@@ -673,14 +742,17 @@ class ActorRolloutRefWorker(Worker):
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         timing_log_prob = {}
+        self._pp_tracer.record_hbm("before_compute_log_prob")
 
         # Pair groups were created in init_model (before vLLM init)
         assert self._pp_pair_groups is not None, "PP pair groups not initialized"
 
-        with simple_timer("load_inference", timing_log_prob):
-            if self._is_offload_param:
-                _load_module(self.train_stage, self.device)
-                log_gpu_memory_usage("After load actor params during compute_log_prob", logger=logger)
+        with self._pp_tracer.phase("load_inference"):
+            with simple_timer("load_inference", timing_log_prob):
+                if self._is_offload_param:
+                    _load_module(self.train_stage, self.device)
+                    log_gpu_memory_usage("After load actor params during compute_log_prob", logger=logger)
+        self._pp_tracer.record_hbm("after_load_inference")
 
         self.train_stage.eval()
         data = data.to(get_device_name())
@@ -702,19 +774,21 @@ class ActorRolloutRefWorker(Worker):
 
         print(f"[PP rank {self.pp_rank}] compute_log_prob M={M}, about to call _pp_forward_log_prob", flush=True)
 
-        with simple_timer("compute_log_prob", timing_log_prob):
-            full_log_probs, full_entropy = _pp_forward_log_prob(
-                stage=self.train_stage,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                M=M,
-                hidden_size=self.hidden_size,
-                pp_rank=self.pp_rank,
-                device=self.device,
-                calculate_entropy=True,
-                pp_pair_groups=self._pp_pair_groups,
-                use_remove_padding=self._use_remove_padding,
-            )
+        with self._pp_tracer.phase("compute_log_prob"):
+            with simple_timer("compute_log_prob", timing_log_prob):
+                full_log_probs, full_entropy = _pp_forward_log_prob(
+                    stage=self.train_stage,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    M=M,
+                    hidden_size=self.hidden_size,
+                    pp_rank=self.pp_rank,
+                    device=self.device,
+                    calculate_entropy=True,
+                    pp_pair_groups=self._pp_pair_groups,
+                    use_remove_padding=self._use_remove_padding,
+                )
+        self._pp_tracer.record_hbm("after_compute_log_prob")
 
         self.train_stage.train()
 
@@ -729,10 +803,12 @@ class ActorRolloutRefWorker(Worker):
         else:
             output = DataProto(meta_info={})
 
-        with simple_timer("unload_inference", timing_log_prob):
-            if self._is_offload_param:
-                _offload_module(self.train_stage)
-                log_gpu_memory_usage("After offload actor params during compute_log_prob", logger=logger)
+        with self._pp_tracer.phase("unload_inference"):
+            with simple_timer("unload_inference", timing_log_prob):
+                if self._is_offload_param:
+                    _offload_module(self.train_stage)
+                    log_gpu_memory_usage("After offload actor params during compute_log_prob", logger=logger)
+        self._pp_tracer.record_hbm("after_unload_inference")
 
         aggressive_empty_cache(force_sync=True)
         timing_log_prob = reduce_timing(timing_log_prob)
@@ -756,10 +832,12 @@ class ActorRolloutRefWorker(Worker):
         # Pair groups were created in init_model (before vLLM init)
         assert self._pp_pair_groups is not None, "PP pair groups not initialized"
 
-        with simple_timer("load_ref", timing_ref):
-            if self._ref_is_offload_param:
-                _load_module(self.ref_stage, self.device)
-                log_gpu_memory_usage("After load ref params during compute_ref_log_prob", logger=logger)
+        with self._pp_tracer.phase("load_ref"):
+            with simple_timer("load_ref", timing_ref):
+                if self._ref_is_offload_param:
+                    _load_module(self.ref_stage, self.device)
+                    log_gpu_memory_usage("After load ref params during compute_ref_log_prob", logger=logger)
+        self._pp_tracer.record_hbm("after_load_ref")
 
         data = data.to(get_device_name())
 
@@ -775,18 +853,19 @@ class ActorRolloutRefWorker(Worker):
         while B % M != 0 and M > 1:
             M -= 1
 
-        with simple_timer("compute_ref_log_prob", timing_ref):
-            full_log_probs, _ = _pp_forward_log_prob(
-                stage=self.ref_stage,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                M=M,
-                hidden_size=self.hidden_size,
-                pp_rank=self.pp_rank,
-                device=self.device,
-                calculate_entropy=False,
-                pp_pair_groups=self._pp_pair_groups,
-                use_remove_padding=self._use_remove_padding,
+        with self._pp_tracer.phase("compute_ref_log_prob"):
+            with simple_timer("compute_ref_log_prob", timing_ref):
+                full_log_probs, _ = _pp_forward_log_prob(
+                    stage=self.ref_stage,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    M=M,
+                    hidden_size=self.hidden_size,
+                    pp_rank=self.pp_rank,
+                    device=self.device,
+                    calculate_entropy=False,
+                    pp_pair_groups=self._pp_pair_groups,
+                    use_remove_padding=self._use_remove_padding,
             )
 
         if self.ref_stage.is_last:
@@ -797,10 +876,12 @@ class ActorRolloutRefWorker(Worker):
         else:
             output = DataProto(meta_info={})
 
-        with simple_timer("unload_ref", timing_ref):
-            if self._ref_is_offload_param:
-                _offload_module(self.ref_stage)
-                log_gpu_memory_usage("After offload ref params during compute_ref_log_prob", logger=logger)
+        with self._pp_tracer.phase("unload_ref"):
+            with simple_timer("unload_ref", timing_ref):
+                if self._ref_is_offload_param:
+                    _offload_module(self.ref_stage)
+                    log_gpu_memory_usage("After offload ref params during compute_ref_log_prob", logger=logger)
+        self._pp_tracer.record_hbm("after_unload_ref")
 
         aggressive_empty_cache(force_sync=True)
         timing_ref = reduce_timing(timing_ref)
@@ -824,12 +905,13 @@ class ActorRolloutRefWorker(Worker):
         # Pair groups were created in init_model (before vLLM init)
         assert self._pp_pair_groups is not None, "PP pair groups not initialized"
 
-        with simple_timer("load_training", timing_update):
-            if self._is_offload_param:
-                _load_module(self.train_stage, self.device)
-                log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
-            if self._is_offload_optimizer:
-                _load_optimizer(self.optimizer, self.device)
+        with self._pp_tracer.phase("load_training"):
+            with simple_timer("load_training", timing_update):
+                if self._is_offload_param:
+                    _load_module(self.train_stage, self.device)
+                    log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
+                if self._is_offload_optimizer:
+                    _load_optimizer(self.optimizer, self.device)
                 log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
         self.train_stage.train()
@@ -853,7 +935,11 @@ class ActorRolloutRefWorker(Worker):
             M -= 1
         micro_B = B // M
 
-        with simple_timer("update_policy", timing_update):
+        self._step_counter += 1
+        self._pp_tracer._step = self._step_counter  # finalize step number
+        self._pp_tracer.record_hbm("before_update_actor")
+
+        with self._pp_tracer.phase("update_actor"), simple_timer("update_policy", timing_update):
             self.train_stage.set_batch_data(
                 input_ids, attention_mask, M,
                 use_remove_padding=self._use_remove_padding,
@@ -893,6 +979,8 @@ class ActorRolloutRefWorker(Worker):
                 dist.recv(buf, src=src_rank, group=group)
                 return buf.to(self.device)
 
+            tracer = self._pp_tracer
+
             for op in schedule:
                 mb = op.micro_batch_id
 
@@ -904,40 +992,46 @@ class ActorRolloutRefWorker(Worker):
                             act_shape = (1, nnz, self.hidden_size)
                         else:
                             act_shape = (micro_B, S, self.hidden_size)
-                        input_hidden = _p2p_recv(act_shape, self.pp_rank - 1, self.train_stage.dtype)
+                        with tracer.trace("p2p_recv", mb):
+                            input_hidden = _p2p_recv(act_shape, self.pp_rank - 1, self.train_stage.dtype)
                         input_hidden.requires_grad_(True)
 
-                    output = self.train_stage.forward_step(
-                        mb, input_hidden,
-                        return_hidden=self.train_stage.is_last,
-                    )
+                    with tracer.trace("train_forward", mb):
+                        output = self.train_stage.forward_step(
+                            mb, input_hidden,
+                            return_hidden=self.train_stage.is_last,
+                        )
 
                     if self.train_stage.is_last:
-                        loss, stats = compute_grpo_loss_fused(
-                            hidden_states=output,
-                            lm_head_weight=self.train_stage.lm_head_weight,
-                            input_ids=micro_input_ids[mb],
-                            response_start_positions=micro_resp_starts[mb],
-                            old_log_probs=micro_old_lp[mb],
-                            advantages=micro_adv[mb],
-                            response_mask=micro_resp_mask[mb],
-                            ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
-                            clip_ratio=self.config.actor.clip_ratio,
-                            kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
-                            entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
-                        )
-                        scaled_loss = loss / M
-                        scaled_loss.backward()
+                        with tracer.trace("loss", mb):
+                            loss, stats = compute_grpo_loss_fused(
+                                hidden_states=output,
+                                lm_head_weight=self.train_stage.lm_head_weight,
+                                input_ids=micro_input_ids[mb],
+                                response_start_positions=micro_resp_starts[mb],
+                                old_log_probs=micro_old_lp[mb],
+                                advantages=micro_adv[mb],
+                                response_mask=micro_resp_mask[mb],
+                                ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
+                                clip_ratio=self.config.actor.clip_ratio,
+                                kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
+                                entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
+                            )
+                            scaled_loss = loss / M
+                            scaled_loss.backward()
                         all_stats.append(stats)
                     else:
-                        handle = _p2p_send(output.detach(), self.pp_rank + 1)
+                        with tracer.trace("p2p_send", mb):
+                            handle = _p2p_send(output.detach(), self.pp_rank + 1)
                         pending_sends.append(handle)
 
                 elif op.op == "backward":
                     if self.train_stage.is_last:
-                        input_grad = self.train_stage.backward_step(mb, grad_output=None)
+                        with tracer.trace("train_backward", mb):
+                            input_grad = self.train_stage.backward_step(mb, grad_output=None)
                         if input_grad is not None:
-                            handle = _p2p_send(input_grad, self.pp_rank - 1)
+                            with tracer.trace("p2p_send", mb):
+                                handle = _p2p_send(input_grad, self.pp_rank - 1)
                             pending_sends.append(handle)
                     else:
                         nnz = self.train_stage._micro_nnz[mb]
@@ -945,24 +1039,32 @@ class ActorRolloutRefWorker(Worker):
                             act_shape = (1, nnz, self.hidden_size)
                         else:
                             act_shape = (micro_B, S, self.hidden_size)
-                        grad = _p2p_recv(act_shape, self.pp_rank + 1, self.train_stage.dtype)
-                        input_grad = self.train_stage.backward_step(mb, grad_output=grad)
+                        with tracer.trace("p2p_recv", mb):
+                            grad = _p2p_recv(act_shape, self.pp_rank + 1, self.train_stage.dtype)
+                        with tracer.trace("train_backward", mb):
+                            input_grad = self.train_stage.backward_step(mb, grad_output=grad)
 
                         if not self.train_stage.is_first and input_grad is not None:
-                            handle = _p2p_send(input_grad, self.pp_rank - 1)
+                            with tracer.trace("p2p_send", mb):
+                                handle = _p2p_send(input_grad, self.pp_rank - 1)
                             pending_sends.append(handle)
 
             for handle in pending_sends:
                 handle.wait()
 
-            grad_clip = self.config.actor.get("grad_clip", 1.0)
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.train_stage.parameters(), grad_clip)
-            self.optimizer.step()
+            with tracer.trace("optimizer"):
+                grad_clip = self.config.actor.get("grad_clip", 1.0)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.train_stage.parameters(), grad_clip)
+                self.optimizer.step()
             self.train_stage.clear_batch_data()
+
+        self._pp_tracer.record_hbm("after_update_actor")
 
         # Build metrics (matches megatron output format)
         metrics = {}
+        if self._enable_pp_trace:
+            metrics.update(self._pp_tracer.summary())
         if all_stats:
             for key in all_stats[0]:
                 vals = [s[key] for s in all_stats]
@@ -974,13 +1076,18 @@ class ActorRolloutRefWorker(Worker):
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
-        with simple_timer("unload_training", timing_update):
-            if self._is_offload_param:
-                _offload_module(self.train_stage)
-                log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
-            if self._is_offload_optimizer:
-                _offload_optimizer(self.optimizer)
-                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        with self._pp_tracer.phase("unload_training"):
+            with simple_timer("unload_training", timing_update):
+                if self._is_offload_param:
+                    _offload_module(self.train_stage)
+                    log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
+                if self._is_offload_optimizer:
+                    _offload_optimizer(self.optimizer)
+                    log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        self._pp_tracer.record_hbm("after_unload_training")
+
+        # Save trace AFTER all phases including unload
+        self._pp_tracer.end_step()
 
         aggressive_empty_cache(force_sync=True)
         timing_update = reduce_timing(timing_update)
