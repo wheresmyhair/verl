@@ -97,13 +97,34 @@ class InferenceStage:
         self,
         micro_batch_id: int,
         input_hidden: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         """
         Forward one micro-batch through this inference stage (no grad).
+
+        Args:
+            return_hidden: If True and this is the last infer stage, return
+                hidden states [B, S, H] instead of logits [B, S, V].
         """
         ids = self._micro_input_ids[micro_batch_id]
         attn_mask = self._micro_attention_mask[micro_batch_id]
         pos_ids = self._micro_position_ids[micro_batch_id]
+
+        if return_hidden and self.is_last_infer:
+            # Call inner model only (no lm_head) to avoid materializing [B,S,V]
+            inner = self.stage.model.model
+            kwargs = dict(
+                attention_mask=attn_mask,
+                position_ids=pos_ids,
+                use_cache=False,
+            )
+            if self.is_first_infer:
+                kwargs["input_ids"] = ids
+            else:
+                assert input_hidden is not None
+                kwargs["inputs_embeds"] = input_hidden
+            inner_out = inner(**kwargs)
+            return inner_out[0]  # [B, S, H]
 
         if self.is_first_infer:
             output = self.stage.model(
@@ -140,6 +161,39 @@ class InferenceStage:
 
         input_ids = self._micro_input_ids[micro_batch_id]
         full_log_probs = log_probs_from_logits(logits, input_ids)
+        resp_log_probs = gather_response_log_probs(
+            full_log_probs, response_start_positions, max_resp_len
+        )
+        return resp_log_probs
+
+    @torch.no_grad()
+    def compute_log_probs_fused(
+        self,
+        micro_batch_id: int,
+        hidden_states: torch.Tensor,
+        response_start_positions: torch.Tensor,
+        max_resp_len: int,
+    ) -> torch.Tensor:
+        """
+        Compute old_log_probs from hidden states using FusedLinearForPPO.
+        Never materializes [B, S, V] logits.
+        """
+        from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+        assert self.is_last_infer, "compute_log_probs_fused only on last inference stage"
+
+        input_ids = self._micro_input_ids[micro_batch_id]
+        rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
+
+        fused = FusedLinearForPPO(chunk_size=512)
+        full_log_probs, _ = fused.forward(
+            hidden_states=hidden_states,
+            vocab_weights=self.stage.lm_head_weight,
+            input_ids=rolled_labels,
+            temperature=1.0,
+        )
+        full_log_probs = full_log_probs[:, :-1]  # [B, S-1]
+
         resp_log_probs = gather_response_log_probs(
             full_log_probs, response_start_positions, max_resp_len
         )

@@ -58,6 +58,7 @@ from .torch_pp.fused_schedule import (
 )
 from .torch_pp.loss import (
     compute_grpo_loss,
+    compute_grpo_loss_fused,
     entropy_from_logits,
     gather_response_log_probs,
     log_probs_from_logits,
@@ -127,14 +128,20 @@ def _pp_forward_log_prob(
     device: torch.device,
     calculate_entropy: bool = True,
     pp_pair_groups: dict = None,
+    use_fused_loss: bool = True,
 ):
     """
     Run forward-only PP across all micro-batches and collect log probs
     on the last stage. Matches the megatron actor's compute_log_prob pattern.
 
+    When use_fused_loss=True, the last stage returns hidden states and
+    applies FusedLinearForPPO to avoid materializing [B, S, V] logits.
+
     Returns (full_log_probs, full_entropy) on last stage, (None, None) elsewhere.
     Both are [B, S-1] shaped.
     """
+    from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
     B, S = input_ids.shape
     micro_B = B // M
 
@@ -143,10 +150,12 @@ def _pp_forward_log_prob(
     all_log_probs = []
     all_entropys = []
 
+    fused = FusedLinearForPPO(chunk_size=512) if use_fused_loss else None
+
     with torch.no_grad():
         for mb in range(M):
             if stage.is_first:
-                output = stage.forward_step(mb)
+                output = stage.forward_step(mb, return_hidden=(use_fused_loss and stage.is_last))
             else:
                 act_shape = (micro_B, S, hidden_size)
                 # Gloo requires CPU tensors for P2P
@@ -154,14 +163,27 @@ def _pp_forward_log_prob(
                 pair_group = pp_pair_groups[pp_rank - 1]
                 dist.recv(hidden_cpu, src=pp_rank - 1, group=pair_group)
                 hidden = hidden_cpu.to(device)
-                output = stage.forward_step(mb, hidden)
+                output = stage.forward_step(mb, hidden, return_hidden=(use_fused_loss and stage.is_last))
 
             if stage.is_last:
-                logits = output
                 micro_ids = input_ids.chunk(M, dim=0)[mb]
-                all_log_probs.append(log_probs_from_logits(logits, micro_ids))
-                if calculate_entropy:
-                    all_entropys.append(entropy_from_logits(logits))
+                if use_fused_loss:
+                    # output is hidden_states [B, S, H] — no logits materialized
+                    rolled_labels = torch.roll(micro_ids, shifts=-1, dims=-1)
+                    lp, ent = fused.forward(
+                        hidden_states=output,
+                        vocab_weights=stage.lm_head_weight,
+                        input_ids=rolled_labels,
+                        temperature=1.0,
+                    )
+                    all_log_probs.append(lp[:, :-1])  # [B, S-1]
+                    if calculate_entropy:
+                        all_entropys.append(ent[:, :-1])
+                else:
+                    # output is logits [B, S, V]
+                    all_log_probs.append(log_probs_from_logits(output, micro_ids))
+                    if calculate_entropy:
+                        all_entropys.append(entropy_from_logits(output))
             else:
                 out_t = output.detach().contiguous().cpu()
                 pair_group = pp_pair_groups[pp_rank]
@@ -393,6 +415,7 @@ class ActorRolloutRefWorker(Worker):
 
         # ── Training stage + optimizer ──
         if self._is_actor or self._is_rollout:
+            _enable_gc = self.config.actor.get("gradient_checkpointing", True)
             self.train_stage = PipelineStage.from_pretrained(
                 model_path=local_path,
                 pp_rank=self.pp_rank,
@@ -400,6 +423,7 @@ class ActorRolloutRefWorker(Worker):
                 device=self.device,
                 dtype=self.dtype,
                 trust_remote_code=trust_remote_code,
+                enable_gradient_checkpointing=_enable_gc,
             )
             self.train_stage.train()
             log_gpu_memory_usage("After training stage init", logger=logger)
@@ -826,11 +850,15 @@ class ActorRolloutRefWorker(Worker):
                         input_hidden = _p2p_recv(act_shape, self.pp_rank - 1, self.train_stage.dtype)
                         input_hidden.requires_grad_(True)
 
-                    output = self.train_stage.forward_step(mb, input_hidden)
+                    output = self.train_stage.forward_step(
+                        mb, input_hidden,
+                        return_hidden=self.train_stage.is_last,
+                    )
 
                     if self.train_stage.is_last:
-                        loss, stats = compute_grpo_loss(
-                            logits=output,
+                        loss, stats = compute_grpo_loss_fused(
+                            hidden_states=output,
+                            lm_head_weight=self.train_stage.lm_head_weight,
                             input_ids=micro_input_ids[mb],
                             response_start_positions=micro_resp_starts[mb],
                             old_log_probs=micro_old_lp[mb],
@@ -991,7 +1019,12 @@ class ActorRolloutRefWorker(Worker):
                             dtype=self.train_stage.dtype,
                         )
 
-                    output = self.train_stage.forward_step(mb, input_hidden)
+                    # On the last training stage, return hidden states
+                    # instead of logits to avoid materializing [B, S, V].
+                    output = self.train_stage.forward_step(
+                        mb, input_hidden,
+                        return_hidden=is_last_train,
+                    )
 
                     if is_last_train:
                         if P == 1:
@@ -1008,8 +1041,11 @@ class ActorRolloutRefWorker(Worker):
 
                         all_old_log_probs[mb] = old_lp.detach()
 
-                        loss, stats = compute_grpo_loss(
-                            logits=output,
+                        # Fused loss: hidden [B,S,H] + lm_head.weight → log_probs
+                        # without ever materializing [B, S, V] logits.
+                        loss, stats = compute_grpo_loss_fused(
+                            hidden_states=output,
+                            lm_head_weight=self.train_stage.lm_head_weight,
                             input_ids=micro_input_ids[mb],
                             response_start_positions=micro_resp_starts[mb],
                             old_log_probs=old_lp,
@@ -1072,12 +1108,16 @@ class ActorRolloutRefWorker(Worker):
                             dtype=self.infer_stage.dtype,
                         )
 
-                    output = self.infer_stage.forward_step(mb, input_hidden)
+                    output = self.infer_stage.forward_step(
+                        mb, input_hidden,
+                        return_hidden=is_last_infer,
+                    )
 
                     if is_last_infer:
-                        log_probs = self.infer_stage.compute_log_probs(
+                        # output is hidden_states [B, S, H] — fused path
+                        log_probs = self.infer_stage.compute_log_probs_fused(
                             micro_batch_id=mb,
-                            logits=output,
+                            hidden_states=output,
                             response_start_positions=micro_infer_resp_starts[mb],
                             max_resp_len=R,
                         )

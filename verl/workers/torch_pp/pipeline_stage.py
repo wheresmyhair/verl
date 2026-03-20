@@ -282,14 +282,45 @@ class PipelineStage(nn.Module):
         self,
         micro_batch_id: int,
         input_hidden: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
         """
         Forward one micro-batch through this stage.
+
+        Args:
+            return_hidden: If True and this is the last stage, return hidden
+                states [B, S, H] from BEFORE lm_head instead of logits
+                [B, S, V].  Used with FusedLinearForPPO to avoid
+                materializing the full logits tensor.
         """
         ids = self._micro_input_ids[micro_batch_id]
         attn_mask = self._micro_attention_mask[micro_batch_id]
         pos_ids = self._micro_position_ids[micro_batch_id]
 
+        if return_hidden and self.is_last:
+            # Call the inner model (embed + layers + norm) to get hidden
+            # states WITHOUT the lm_head projection.  This avoids
+            # materializing the [B, S, V] logits tensor.
+            inner = self.model.model  # e.g. Qwen3Model
+            kwargs = dict(
+                attention_mask=attn_mask,
+                position_ids=pos_ids,
+                use_cache=False,
+            )
+            if self.is_first:
+                self._stash[micro_batch_id] = (None,)
+                kwargs["input_ids"] = ids
+            else:
+                assert input_hidden is not None
+                self._stash[micro_batch_id] = (input_hidden,)
+                kwargs["inputs_embeds"] = input_hidden
+            inner_out = inner(**kwargs)
+            hidden = inner_out[0]  # last_hidden_state [B, S, H]
+            self._stash[micro_batch_id] = (self._stash[micro_batch_id][0], hidden)
+            return hidden
+
+        # Standard path: full model forward (returns logits on last stage,
+        # hidden states on non-last stages).
         if self.is_first:
             self._stash[micro_batch_id] = (None,)
             output = self.model(
@@ -312,6 +343,11 @@ class PipelineStage(nn.Module):
         out_tensor = output.logits if hasattr(output, "logits") else output[0]
         self._stash[micro_batch_id] = (self._stash[micro_batch_id][0], out_tensor)
         return out_tensor
+
+    @property
+    def lm_head_weight(self) -> torch.Tensor:
+        """Access lm_head weight for fused linear cross-entropy."""
+        return self.model.lm_head.weight
 
     # ──────────────────────────────────────────────────────────────────
     # Backward
@@ -354,6 +390,7 @@ class PipelineStage(nn.Module):
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = True,
+        enable_gradient_checkpointing: bool = False,
     ) -> "PipelineStage":
         """
         Load a HuggingFace model with partial loading — no full model
@@ -398,6 +435,15 @@ class PipelineStage(nn.Module):
         # Must happen AFTER .to() so the buffers are created in float32
         # on the correct device (rope_init_fn creates inv_freq as float32).
         _reinit_non_persistent_buffers(model, config)
+
+        # 7. Enable gradient checkpointing to reduce activation memory.
+        # Critical for 1F1B: earlier PP stages stash multiple micro-batch
+        # autograd graphs during warmup. Without checkpointing, all
+        # intermediate activations are held in memory simultaneously.
+        if enable_gradient_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         t_load = time.time() - t0
 

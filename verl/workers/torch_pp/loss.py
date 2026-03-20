@@ -213,3 +213,113 @@ def compute_grpo_loss(
             stats["entropy"] = per_token_entropy[valid].mean().item() if valid.any() else 0.0
 
     return loss, stats
+
+
+def compute_grpo_loss_fused(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    input_ids: torch.Tensor,
+    response_start_positions: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    ref_log_probs: Optional[torch.Tensor] = None,
+    clip_ratio: float = 0.2,
+    kl_coef: float = 0.001,
+    entropy_coef: float = 0.0,
+    loss_agg: str = "token-mean",
+    chunk_size: int = 512,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    GRPO loss using FusedLinearForPPO — never materializes [B, S, V] logits.
+
+    Instead of:  hidden → lm_head → [B,S,V] logits → log_softmax → gather
+    Does:        hidden + lm_head.weight → chunked matmul+softmax → log_probs
+
+    Peak memory: [chunk_size, V] instead of [B*S, V].
+
+    Args:
+        hidden_states:            [B, S, H] from last transformer layer (pre-lm_head)
+        lm_head_weight:           [V, H] the lm_head projection weight
+        input_ids:                [B, S] token IDs
+        (remaining args same as compute_grpo_loss)
+
+    Returns:
+        (loss, stats_dict)
+    """
+    from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+    R = old_log_probs.size(1)
+
+    # FusedLinearForPPO expects rolled labels: position i predicts label[i]
+    # which should be input_ids[i+1] for causal LM
+    rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
+
+    fused = FusedLinearForPPO(chunk_size=chunk_size)
+    full_log_probs, full_entropy = fused.forward(
+        hidden_states=hidden_states,
+        vocab_weights=lm_head_weight,
+        input_ids=rolled_labels,
+        temperature=1.0,
+    )
+    # full_log_probs/full_entropy: [B, S] — drop last position (garbage from roll)
+    new_full_lp = full_log_probs[:, :-1]  # [B, S-1], matches shifted convention
+    new_resp_lp = gather_response_log_probs(new_full_lp, response_start_positions, R)
+    new_resp_lp = new_resp_lp * response_mask  # [B, R]
+
+    # Ratio
+    log_ratio = new_resp_lp - old_log_probs
+    ratio = torch.exp(log_ratio)
+    clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+
+    # Policy gradient loss
+    adv = advantages.unsqueeze(1)  # [B, 1]
+    pg_loss = torch.max(-ratio * adv, -clipped * adv)  # [B, R]
+
+    # KL penalty
+    kl_loss = torch.zeros_like(pg_loss)
+    if ref_log_probs is not None and kl_coef > 0.0:
+        kl_loss = kl_coef * (new_resp_lp - ref_log_probs)
+
+    # Entropy bonus
+    ent_loss = torch.zeros_like(pg_loss)
+    per_token_entropy = None
+    if entropy_coef > 0.0:
+        full_ent = full_entropy[:, :-1]  # [B, S-1]
+        per_token_entropy = gather_response_log_probs(
+            full_ent, response_start_positions, R
+        ) * response_mask
+        ent_loss = -entropy_coef * per_token_entropy
+
+    # Combine and aggregate
+    token_loss = (pg_loss + kl_loss + ent_loss) * response_mask
+    num_tokens = response_mask.sum().clamp(min=1)
+
+    if loss_agg == "token-mean":
+        loss = token_loss.sum() / num_tokens
+    elif loss_agg == "seq-mean":
+        per_seq = response_mask.sum(dim=1).clamp(min=1)
+        loss = (token_loss.sum(dim=1) / per_seq).mean()
+    else:
+        raise ValueError(f"Unknown loss_agg: {loss_agg}")
+
+    # Logging stats (detached)
+    with torch.no_grad():
+        valid = response_mask.bool()
+        stats = {
+            "loss": loss.item(),
+            "pg_loss": (pg_loss * response_mask).sum().item() / num_tokens.item(),
+            "ratio_mean": ratio[valid].mean().item() if valid.any() else 0.0,
+            "ratio_max": ratio[valid].max().item() if valid.any() else 0.0,
+            "clip_frac": ((ratio[valid] - 1.0).abs() > clip_ratio).float().mean().item()
+            if valid.any()
+            else 0.0,
+        }
+        if ref_log_probs is not None and kl_coef > 0.0:
+            stats["kl_per_token"] = (
+                (new_resp_lp - ref_log_probs)[valid].mean().item() if valid.any() else 0.0
+            )
+        if per_token_entropy is not None:
+            stats["entropy"] = per_token_entropy[valid].mean().item() if valid.any() else 0.0
+
+    return loss, stats
