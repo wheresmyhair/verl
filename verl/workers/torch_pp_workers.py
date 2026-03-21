@@ -66,17 +66,6 @@ from .torch_pp.loss import (
 )
 from .torch_pp.pp_trace import PPTracer
 from .torch_pp.response_length_profiler import ResponseLengthProfiler
-from .torch_pp.comm import (
-    recv_activation,
-    recv_grad,
-    recv_infer_activation,
-    recv_old_log_probs,
-    send_activation,
-    send_grad,
-    send_infer_activation,
-    send_old_log_probs,
-)
-
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -638,6 +627,14 @@ class ActorRolloutRefWorker(Worker):
             pair_group = dist.new_group(ranks=[i, i + 1], backend="gloo")
             if rank == i or rank == i + 1:
                 pair_groups[i] = pair_group
+
+        # Fused forward needs rank 0 ↔ rank P-1 for old_log_probs transfer.
+        # For P>=3 these ranks aren't adjacent, so create a dedicated group.
+        # Always create it (new_group is a collective — all ranks must call it).
+        if world_size >= 3:
+            olp_group = dist.new_group(ranks=[0, world_size - 1], backend="gloo")
+            if rank == 0 or rank == world_size - 1:
+                pair_groups["olp"] = olp_group
 
         set_pp_pair_groups(pair_groups)
         self._pp_pair_groups = pair_groups
@@ -1338,7 +1335,14 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor and self._fused_forward
         timing_fused = {}
 
-        with simple_timer("load_training", timing_fused):
+        # Pair groups were created in init_model (before vLLM init)
+        assert self._pp_pair_groups is not None, "PP pair groups not initialized"
+
+        self._step_counter += 1
+        self._pp_tracer._step = self._step_counter
+        self._pp_tracer.record_hbm("before_fused_update_actor")
+
+        with self._pp_tracer.phase("load_training"), simple_timer("load_training", timing_fused):
             if self._is_offload_param:
                 _load_module(self.train_stage, self.device)
                 log_gpu_memory_usage("After load actor params during fused_update_actor", logger=logger)
@@ -1369,7 +1373,9 @@ class ActorRolloutRefWorker(Worker):
             M -= 1
         micro_B = B // M
 
-        with simple_timer("fused_update_policy", timing_fused):
+        tracer = self._pp_tracer
+
+        with tracer.phase("fused_update_actor"), simple_timer("fused_update_policy", timing_fused):
             # Set batch data on BOTH stages
             self.train_stage.set_batch_data(
                 input_ids, attention_mask, M,
@@ -1402,6 +1408,28 @@ class ActorRolloutRefWorker(Worker):
 
             all_stats: List[Dict[str, float]] = []
             pending_sends: List = []
+            _send_bufs: List = []  # prevent GC before isend completes
+
+            def _get_pair_group(rank_a, rank_b):
+                """Look up the gloo pair group for two ranks."""
+                if abs(rank_a - rank_b) == 1:
+                    return self._pp_pair_groups[min(rank_a, rank_b)]
+                # Non-adjacent: old_log_probs group (rank 0 ↔ P-1)
+                return self._pp_pair_groups["olp"]
+
+            def _p2p_send(tensor, dst_rank):
+                """Non-blocking send via gloo pair group (CPU-staged)."""
+                t = tensor.detach().contiguous().cpu()
+                _send_bufs.append(t)
+                group = _get_pair_group(self.pp_rank, dst_rank)
+                return dist.isend(t, dst=dst_rank, group=group)
+
+            def _p2p_recv(shape, src_rank, dtype):
+                """Recv via gloo pair group (CPU-staged)."""
+                buf = torch.empty(shape, dtype=dtype, device="cpu")
+                group = _get_pair_group(self.pp_rank, src_rank)
+                dist.recv(buf, src=src_rank, group=group)
+                return buf.to(self.device)
             old_log_probs_stash: Dict[int, torch.Tensor] = {}
             all_old_log_probs = [None] * M
 
@@ -1415,90 +1443,67 @@ class ActorRolloutRefWorker(Worker):
                     if not self.train_stage.is_first:
                         nnz = self.train_stage._micro_nnz[mb]
                         act_shape = (1, nnz, self.hidden_size) if self._use_remove_padding else (micro_B, S, self.hidden_size)
-                        input_hidden = recv_activation(
-                            shape=act_shape,
-                            src_rank=self.pp_rank - 1,
-                            micro_batch_id=mb,
-                            device=self.device,
-                            dtype=self.train_stage.dtype,
-                        )
+                        with tracer.trace("p2p_recv", mb):
+                            input_hidden = _p2p_recv(act_shape, self.pp_rank - 1, self.train_stage.dtype)
+                        input_hidden.requires_grad_(True)
 
-                    # On the last training stage, return hidden states
-                    # instead of logits to avoid materializing [B, S, V].
-                    output = self.train_stage.forward_step(
-                        mb, input_hidden,
-                        return_hidden=is_last_train,
-                    )
+                    with tracer.trace("train_forward", mb):
+                        output = self.train_stage.forward_step(
+                            mb, input_hidden,
+                            return_hidden=is_last_train,
+                        )
 
                     if is_last_train:
                         if P == 1:
                             old_lp = old_log_probs_stash.pop(mb)
                         else:
-                            olp_shape = (micro_B, R)
-                            old_lp = recv_old_log_probs(
-                                shape=olp_shape,
-                                src_rank=0,
-                                micro_batch_id=mb,
-                                device=self.device,
-                                dtype=self.train_stage.dtype,
-                            )
+                            with tracer.trace("p2p_recv", mb):
+                                olp_shape = (micro_B, R)
+                                old_lp = _p2p_recv(olp_shape, 0, self.train_stage.dtype)
 
                         all_old_log_probs[mb] = old_lp.detach()
 
-                        # Fused loss: hidden [B,S,H] + lm_head.weight → log_probs
-                        # without ever materializing [B, S, V] logits.
-                        loss, stats = compute_grpo_loss_fused(
-                            hidden_states=output,
-                            lm_head_weight=self.train_stage.lm_head_weight,
-                            input_ids=micro_input_ids[mb],
-                            response_start_positions=micro_resp_starts[mb],
-                            old_log_probs=old_lp,
-                            advantages=micro_adv[mb],
-                            response_mask=micro_resp_mask[mb],
-                            ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
-                            clip_ratio=self.config.actor.clip_ratio,
-                            kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
-                            entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
-                        )
-                        scaled_loss = loss / M
-                        scaled_loss.backward()
+                        with tracer.trace("loss", mb):
+                            loss, stats = compute_grpo_loss_fused(
+                                hidden_states=output,
+                                lm_head_weight=self.train_stage.lm_head_weight,
+                                input_ids=micro_input_ids[mb],
+                                response_start_positions=micro_resp_starts[mb],
+                                old_log_probs=old_lp,
+                                advantages=micro_adv[mb],
+                                response_mask=micro_resp_mask[mb],
+                                ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
+                                clip_ratio=self.config.actor.clip_ratio,
+                                kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
+                                entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
+                            )
+                            scaled_loss = loss / M
+                            scaled_loss.backward()
                         all_stats.append(stats)
                     else:
-                        handle = send_activation(
-                            output.detach(),
-                            dst_rank=self.pp_rank + 1,
-                            micro_batch_id=mb,
-                        )
+                        with tracer.trace("p2p_send", mb):
+                            handle = _p2p_send(output.detach(), self.pp_rank + 1)
                         pending_sends.append(handle)
 
                 elif op.op == "train_backward":
                     if is_last_train:
-                        input_grad = self.train_stage.backward_step(mb, grad_output=None)
+                        with tracer.trace("train_backward", mb):
+                            input_grad = self.train_stage.backward_step(mb, grad_output=None)
                         if input_grad is not None:
-                            handle = send_grad(
-                                input_grad,
-                                dst_rank=self.pp_rank - 1,
-                                micro_batch_id=mb,
-                            )
+                            with tracer.trace("p2p_send", mb):
+                                handle = _p2p_send(input_grad, self.pp_rank - 1)
                             pending_sends.append(handle)
                     else:
                         nnz = self.train_stage._micro_nnz[mb]
                         act_shape = (1, nnz, self.hidden_size) if self._use_remove_padding else (micro_B, S, self.hidden_size)
-                        grad = recv_grad(
-                            shape=act_shape,
-                            src_rank=self.pp_rank + 1,
-                            micro_batch_id=mb,
-                            device=self.device,
-                            dtype=self.train_stage.dtype,
-                        )
-                        input_grad = self.train_stage.backward_step(mb, grad_output=grad)
+                        with tracer.trace("p2p_recv", mb):
+                            grad = _p2p_recv(act_shape, self.pp_rank + 1, self.train_stage.dtype)
+                        with tracer.trace("train_backward", mb):
+                            input_grad = self.train_stage.backward_step(mb, grad_output=grad)
 
                         if not self.train_stage.is_first and input_grad is not None:
-                            handle = send_grad(
-                                input_grad,
-                                dst_rank=self.pp_rank - 1,
-                                micro_batch_id=mb,
-                            )
+                            with tracer.trace("p2p_send", mb):
+                                handle = _p2p_send(input_grad, self.pp_rank - 1)
                             pending_sends.append(handle)
 
                 elif op.op == "infer_forward":
@@ -1506,57 +1511,52 @@ class ActorRolloutRefWorker(Worker):
                     if not self.infer_stage.is_first_infer:
                         nnz = self.infer_stage._micro_nnz[mb]
                         act_shape = (1, nnz, self.hidden_size) if self._use_remove_padding else (micro_B, S, self.hidden_size)
-                        input_hidden = recv_infer_activation(
-                            shape=act_shape,
-                            src_rank=self.pp_rank + 1,
-                            micro_batch_id=mb,
-                            device=self.device,
-                            dtype=self.infer_stage.dtype,
-                        )
+                        with tracer.trace("p2p_recv", mb):
+                            input_hidden = _p2p_recv(act_shape, self.pp_rank + 1, self.infer_stage.dtype)
 
-                    output = self.infer_stage.forward_step(
-                        mb, input_hidden,
-                        return_hidden=is_last_infer,
-                    )
+                    with tracer.trace("infer_forward", mb):
+                        output = self.infer_stage.forward_step(
+                            mb, input_hidden,
+                            return_hidden=is_last_infer,
+                        )
 
                     if is_last_infer:
-                        # output is hidden_states [B, S, H] — fused path
-                        log_probs = self.infer_stage.compute_log_probs_fused(
-                            micro_batch_id=mb,
-                            hidden_states=output,
-                            response_start_positions=micro_infer_resp_starts[mb],
-                            max_resp_len=R,
-                        )
+                        with tracer.trace("infer_log_probs", mb):
+                            log_probs = self.infer_stage.compute_log_probs_fused(
+                                micro_batch_id=mb,
+                                hidden_states=output,
+                                response_start_positions=micro_infer_resp_starts[mb],
+                                max_resp_len=R,
+                            )
                         if P == 1:
                             old_log_probs_stash[mb] = log_probs
                         else:
-                            handle = send_old_log_probs(
-                                log_probs,
-                                dst_rank=P - 1,
-                                micro_batch_id=mb,
-                            )
+                            with tracer.trace("p2p_send", mb):
+                                handle = _p2p_send(log_probs, P - 1)
                             pending_sends.append(handle)
                     else:
-                        handle = send_infer_activation(
-                            output,
-                            dst_rank=self.pp_rank - 1,
-                            micro_batch_id=mb,
-                        )
+                        with tracer.trace("p2p_send", mb):
+                            handle = _p2p_send(output, self.pp_rank - 1)
                         pending_sends.append(handle)
 
             for handle in pending_sends:
                 handle.wait()
 
-            grad_clip = self.config.actor.get("grad_clip", 1.0)
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.train_stage.parameters(), grad_clip)
-            self.optimizer.step()
+            with tracer.trace("optimizer"):
+                grad_clip = self.config.actor.get("grad_clip", 1.0)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.train_stage.parameters(), grad_clip)
+                self.optimizer.step()
 
             self.train_stage.clear_batch_data()
             self.infer_stage.clear_batch_data()
 
+        tracer.record_hbm("after_fused_update_actor")
+
         # Build metrics
         metrics = {}
+        if self._enable_pp_trace:
+            metrics.update(tracer.summary())
         if all_stats:
             for key in all_stats[0]:
                 vals = [s[key] for s in all_stats]
@@ -1575,7 +1575,7 @@ class ActorRolloutRefWorker(Worker):
             output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
-        with simple_timer("unload_training", timing_fused):
+        with tracer.phase("unload_training"), simple_timer("unload_training", timing_fused):
             if self._is_offload_param:
                 _offload_module(self.train_stage)
                 log_gpu_memory_usage("After offload actor params during fused_update_actor", logger=logger)
@@ -1585,6 +1585,10 @@ class ActorRolloutRefWorker(Worker):
             if self.infer_stage is not None and self._is_offload_param:
                 _offload_module(self.infer_stage)
                 log_gpu_memory_usage("After offload infer stage during fused_update_actor", logger=logger)
+        tracer.record_hbm("after_unload_fused")
+
+        # Save trace AFTER all phases including unload
+        tracer.end_step()
 
         aggressive_empty_cache(force_sync=True)
         timing_fused = reduce_timing(timing_fused)

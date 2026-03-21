@@ -242,17 +242,45 @@ def validate_schedule(
 # -----------------------------------------------------------------------
 
 
+_TYPE_PRIORITY = {"infer_forward": 0, "train_backward": 1, "train_forward": 2}
+
+
+def _select_op(
+    ready: List[Tuple[str, int]],
+) -> Tuple[str, int]:
+    """
+    Pick the next op from a non-empty ready buffer.
+
+    Priority rule (from the fused schedule algorithm):
+      1. Smallest micro-batch index first.
+      2. Tie-break by type: iF > tB > tF.
+    """
+    best = ready[0]
+    for candidate in ready[1:]:
+        c_mb, b_mb = candidate[1], best[1]
+        if c_mb < b_mb or (
+            c_mb == b_mb and _TYPE_PRIORITY[candidate[0]] < _TYPE_PRIORITY[best[0]]
+        ):
+            best = candidate
+    return best
+
+
 def build_default_fused_schedule(
     pp_size: int,
     num_micro_batches: int,
 ) -> Dict[int, List[str]]:
     """
-    Generate a default fused schedule (greedy simulation) as string lists.
+    Generate a default fused schedule using the priority-based algorithm.
 
-    Strategy: simulate time steps assuming uniform op duration.  Each rank
-    greedily picks the next ready op from its queue (train_forward first,
-    then infer_forward, then train_backward) checking that the data
-    dependency from the source rank has been scheduled in an earlier slot.
+    Last rank (P-1) — first inference stage:
+      Run all iF.0 .. iF.(M-1) first, then 1F1B for training.
+
+    All other ranks — ready-buffer dispatch:
+      Maintain a ready buffer of ops whose dependencies are satisfied.
+      SelectOp: smallest micro-batch index first, tie-break iF > tB > tF.
+
+    Global simulation: completing an op on one rank can unblock ops on
+    other ranks in the same time step.
 
     Returns:
         {0: ["tF.0", "tF.1", ...], 1: [...], ...}
@@ -260,55 +288,127 @@ def build_default_fused_schedule(
     M = num_micro_batches
     P = pp_size
 
-    scheduled: Dict[int, List[str]] = {r: [] for r in range(P)}
+    # ── Build the last-rank schedule directly ──
+    last_rank_ops: List[str] = []
+    for mb in range(M):
+        last_rank_ops.append(repr(FusedScheduleOp("infer_forward", mb)))
+    for mb in range(M):
+        last_rank_ops.append(repr(FusedScheduleOp("train_forward", mb)))
+        last_rank_ops.append(repr(FusedScheduleOp("train_backward", mb)))
+
+    scheduled: Dict[int, List[str]] = {P - 1: last_rank_ops}
     completed: Set[Tuple[int, str, int]] = set()
 
-    pending: Dict[int, List[Tuple[str, int]]] = {r: [] for r in range(P)}
-    for r in range(P):
-        for mb in range(M):
-            pending[r].append(("train_forward", mb))
-        for mb in range(M):
-            pending[r].append(("infer_forward", mb))
-        for mb in range(M):
-            pending[r].append(("train_backward", mb))
+    # Mark last-rank ops as completed (in schedule order)
+    for token_str in last_rank_ops:
+        op = parse_schedule([token_str])[0]
+        completed.add((P - 1, op.op, op.micro_batch_id))
 
-    def _is_ready(rank: int, op_type: str, mb: int) -> bool:
+    if P == 1:
+        return scheduled
+
+    # ── Event-driven simulation for ranks 0..P-2 ──
+    #
+    # Each rank runs independently at its own pace.  An op is "ready"
+    # when the dependency's completion_time <= the rank's current clock.
+    # Each op takes 1 time unit.  When the ready buffer is empty the
+    # rank advances its clock to the earliest dependency arrival.
+
+    for r in range(P - 1):
+        scheduled[r] = []
+
+    remaining: Dict[int, Set[Tuple[str, int]]] = {}
+    for r in range(P - 1):
+        remaining[r] = set()
+        for mb in range(M):
+            remaining[r].add(("train_forward", mb))
+            remaining[r].add(("infer_forward", mb))
+            remaining[r].add(("train_backward", mb))
+
+    # completion_time[(rank, op_type, mb)] = wall-clock time when op finishes
+    completion_time: Dict[Tuple[int, str, int], int] = {}
+
+    # Pre-populate last rank's completion times
+    t = 0
+    for token_str in last_rank_ops:
+        op = parse_schedule([token_str])[0]
+        t += 1
+        completion_time[(P - 1, op.op, op.micro_batch_id)] = t
+
+    def _dep_time(rank: int, op_type: str, mb: int) -> int:
+        """Earliest time at which all dependencies for this op are met."""
+        t_dep = 0
         if op_type == "train_forward":
-            if rank > 0 and (rank - 1, "train_forward", mb) not in completed:
-                return False
-            if rank == P - 1 and (0, "infer_forward", mb) not in completed:
-                return False
-            return True
-        if op_type == "train_backward":
-            if (rank, "train_forward", mb) not in completed:
-                return False
+            if rank > 0:
+                key = (rank - 1, "train_forward", mb)
+                if key in completion_time:
+                    t_dep = max(t_dep, completion_time[key])
+                else:
+                    return -1  # dep not yet scheduled
+            if rank == P - 1:
+                key = (0, "infer_forward", mb)
+                if key in completion_time:
+                    t_dep = max(t_dep, completion_time[key])
+                else:
+                    return -1
+        elif op_type == "train_backward":
+            key_own = (rank, "train_forward", mb)
+            if key_own not in completion_time:
+                return -1
+            t_dep = max(t_dep, completion_time[key_own])
             if rank < P - 1:
-                return (rank + 1, "train_backward", mb) in completed
-            return True
-        if op_type == "infer_forward" and rank < P - 1:
-            return (rank + 1, "infer_forward", mb) in completed
-        return True  # Last rank's iF: no dependency
+                key_next = (rank + 1, "train_backward", mb)
+                if key_next not in completion_time:
+                    return -1
+                t_dep = max(t_dep, completion_time[key_next])
+        elif op_type == "infer_forward" and rank < P - 1:
+            key = (rank + 1, "infer_forward", mb)
+            if key in completion_time:
+                t_dep = max(t_dep, completion_time[key])
+            else:
+                return -1
+        return t_dep
 
-    total_ops = 3 * M * P
-    scheduled_count = 0
-    max_iterations = total_ops * total_ops
+    clock: Dict[int, int] = {r: 0 for r in range(P - 1)}
+    total_remaining = 3 * M * (P - 1)
+    max_iterations = total_remaining * total_remaining
 
-    iteration = 0
-    while scheduled_count < total_ops and iteration < max_iterations:
-        iteration += 1
+    for _ in range(max_iterations):
+        if total_remaining <= 0:
+            break
+
+        # Find the rank with the earliest clock that has work to do
         progress = False
-        for r in range(P):
-            if not pending[r]:
+        for r in sorted(range(P - 1), key=lambda x: clock[x]):
+            if not remaining[r]:
                 continue
-            for idx, (op_type, mb) in enumerate(pending[r]):
-                if _is_ready(r, op_type, mb):
-                    token = repr(FusedScheduleOp(op_type, mb))
-                    scheduled[r].append(token)
-                    completed.add((r, op_type, mb))
-                    pending[r].pop(idx)
-                    scheduled_count += 1
-                    progress = True
-                    break
+
+            # Collect ready ops: dependency met by current clock
+            ready = []
+            earliest_future_dep = float("inf")
+            for op_type, mb in remaining[r]:
+                dt = _dep_time(r, op_type, mb)
+                if dt < 0:
+                    continue  # dep not scheduled yet
+                if dt <= clock[r]:
+                    ready.append((op_type, mb))
+                elif dt < earliest_future_dep:
+                    earliest_future_dep = dt
+
+            if ready:
+                op_type, mb = _select_op(ready)
+                token = repr(FusedScheduleOp(op_type, mb))
+                scheduled[r].append(token)
+                clock[r] += 1
+                completion_time[(r, op_type, mb)] = clock[r]
+                remaining[r].discard((op_type, mb))
+                total_remaining -= 1
+                progress = True
+            elif earliest_future_dep < float("inf"):
+                # Advance clock to when next dep arrives
+                clock[r] = earliest_future_dep
+                progress = True
+
         if not progress:
             raise RuntimeError(
                 "Default schedule generator stuck — cannot find any ready op. "

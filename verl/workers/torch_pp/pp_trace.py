@@ -54,6 +54,7 @@ _CATEGORY_COLORS = {
     "train_forward": "good",              # green
     "train_backward": "terrible",         # dark red
     "infer_forward": "olive",             # olive
+    "infer_log_probs": "olive",           # olive (same family as infer)
     "p2p_send": "rail_animation",         # orange
     "p2p_recv": "rail_idle",              # blue-gray
     "loss": "rail_response",              # blue
@@ -237,7 +238,7 @@ class PPTracer:
             cat_totals[cat] = cat_totals.get(cat, 0) + dur_ms
 
         total_ms = sum(cat_totals.values())
-        compute_cats = {"train_forward", "train_backward", "infer_forward", "loss", "optimizer"}
+        compute_cats = {"train_forward", "train_backward", "infer_forward", "infer_log_probs", "loss", "optimizer"}
         comm_cats = {"p2p_send", "p2p_recv"}
         phase_cats = {
             "rollout", "compute_log_prob", "compute_ref_log_prob",

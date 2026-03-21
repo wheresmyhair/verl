@@ -133,3 +133,4 @@ log_*.txt
 
 # profiling
 profiling/
+profiling_fused/

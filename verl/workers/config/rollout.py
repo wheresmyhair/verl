@@ -174,6 +174,18 @@ class RolloutConfig(BaseConfig):
 
     tp_groups: Optional[list] = None  # e.g. [[0,1],[2],[3]] for heterogeneous TP
 
+    # Routing config (used by RolloutRouter in the trainer for het-TP dispatch)
+    routing_strategy: str = "round_robin"
+    routing_warmup_epochs: int = 1
+    routing_prompt_coef: float = 1.0
+    routing_response_coef: float = 4.0
+    routing_default_response_length: float = 1024.0
+    routing_history_estimator: str = "mean"
+    routing_ema_alpha: float = 0.5
+    routing_response_agg: str = "max"
+    routing_group_weights: Optional[list] = None
+    routing_random_seed: int = 0
+
     sglang_engine_mode: str = "local"
 
     limit_images: Optional[int] = None
