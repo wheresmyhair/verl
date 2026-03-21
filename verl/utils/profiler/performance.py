@@ -216,7 +216,9 @@ def reduce_timing(
     for key in sorted(timing_raw.keys()):
         key_list.append(key)
         timing_list.append(timing_raw[key])
-    timing_list = torch.tensor(timing_list, dtype=torch.float32, device=get_device_id())
+    backend = dist.get_backend()
+    reduce_device = get_device_id() if backend == "nccl" else "cpu"
+    timing_list = torch.tensor(timing_list, dtype=torch.float32, device=reduce_device)
     torch.distributed.all_reduce(timing_list, op=reduce_op)
     timing_list = [tensor.item() for tensor in timing_list.to("cpu")]
     timing_generate = {key_list[i]: timing_list[i] for i in range(len(key_list))}
@@ -229,10 +231,12 @@ def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float,
         return -1.0, -1.0, -1.0
 
     world_size = dist.get_world_size()
-    timing_tensor = torch.tensor(timing, dtype=torch.float32, device=get_device_id())
-    tensor_list = [torch.zeros(1, dtype=torch.float32, device=get_device_id()) for _ in range(world_size)]
+    backend = dist.get_backend()
+    reduce_device = get_device_id() if backend == "nccl" else "cpu"
+    timing_tensor = torch.tensor([timing], dtype=torch.float32, device=reduce_device)
+    tensor_list = [torch.zeros(1, dtype=torch.float32, device=reduce_device) for _ in range(world_size)]
     torch.distributed.all_gather(tensor_list, timing_tensor)
-    tensor_stack = torch.stack(tensor_list)
+    tensor_stack = torch.stack(tensor_list).view(world_size)
     timing_min = tensor_stack.min().cpu().item()
     timing_max = tensor_stack.max().cpu().item()
     top_k_percentile = torch.quantile(tensor_stack, 1 - k / 100)

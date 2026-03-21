@@ -328,13 +328,17 @@ class ActorRolloutRefWorker(Worker):
         # ── Initialize torch.distributed (NCCL) ──
         if not torch.distributed.is_initialized():
             set_numa_affinity()
-            rank = int(os.environ["LOCAL_RANK"])
+            local_rank = int(os.environ["LOCAL_RANK"])
+            # Pin the CUDA device before distributed init. When every worker can
+            # see all GPUs (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1),
+            # initializing the process group first can create a stray CUDA
+            # context on GPU 0 in non-owner workers.
+            get_torch_device().set_device(local_rank)
             torch.distributed.init_process_group(
-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                backend="gloo",
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
-            get_torch_device().set_device(rank)
 
         self.pp_rank = self.rank
         self.pp_size = self.world_size

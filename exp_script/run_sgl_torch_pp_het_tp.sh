@@ -14,9 +14,10 @@ fi
 mkdir -p "$PROFILING_DIR"
 
 # setup environment
-# Required for het TP: prevent Ray from remapping CUDA devices so SGLang
-# can correctly manage multi-GPU TP groups via child processes
-export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+# Heterogeneous TP now uses a helper-backed SGLang server on TP leaders.
+# Keep Ray's default per-worker GPU isolation so parent workers do not
+# create stray CUDA contexts on unrelated GPUs.
+unset RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
 
 GPUS_PER_NODE=4
 ENGINE=sglang
