@@ -455,15 +455,30 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
     return decorator
 
 
+def _get_dp_rank_mapping(worker_group):
+    """Get dp_rank_mapping for the 'rollout' mesh, lazily queried and cached."""
+    if "rollout" not in worker_group._dispatch_info:
+        worker_group._dispatch_info["rollout"] = worker_group._query_dispatch_info("rollout")
+    return worker_group._dispatch_info["rollout"]
+
+
 def dispatch_dynamic_index_data_proto(worker_group, *args, **kwargs):
     """
-    Dynamic dispatch function that reads index mapping from DataProto meta_info
-    Supports uneven chunking and configurable mappings per call
+    Dynamic dispatch function that reads index mapping from DataProto meta_info.
+    Supports uneven chunking, configurable mappings per call, and heterogeneous
+    TP (where multiple workers share a dp_rank).
+
+    dp_index_mapping keys are dp_ranks (not worker indices). Workers sharing
+    a dp_rank receive the same data chunk.
     """
     from verl.single_controller.base.worker_group import WorkerGroup
     from verl.protocol import DataProto, DataProtoFuture
     assert isinstance(worker_group, WorkerGroup)
-    
+
+    # Get dp_rank mapping: [dp_rank_of_worker_0, dp_rank_of_worker_1, ...]
+    dp_rank_mapping = _get_dp_rank_mapping(worker_group)
+    num_dp_groups = max(dp_rank_mapping) + 1
+
     # Extract index mapping from the first DataProto argument's meta_info
     index_mapping = None
     data_length = None
@@ -472,33 +487,34 @@ def dispatch_dynamic_index_data_proto(worker_group, *args, **kwargs):
             index_mapping = arg.meta_info.get('dp_index_mapping')
             data_length = len(arg)
             break
-    
-    # If no mapping provided, create even distribution
+
+    # If no mapping provided, create even distribution across DP groups
     if index_mapping is None:
-        print(f"No index mapping provided, creating even distribution")
+        print(f"No index mapping provided, creating even distribution across {num_dp_groups} dp groups")
         index_mapping = {}
-        num_samples_per_rank = data_length // worker_group.world_size
-        for rank in range(worker_group.world_size):
-            if rank == worker_group.world_size - 1:
-                index_mapping[rank] = list(range(rank * num_samples_per_rank, data_length))
+        num_samples_per_dp = data_length // num_dp_groups
+        for dp_rank in range(num_dp_groups):
+            if dp_rank == num_dp_groups - 1:
+                index_mapping[dp_rank] = list(range(dp_rank * num_samples_per_dp, data_length))
             else:
-                index_mapping[rank] = list(range(rank * num_samples_per_rank, (rank + 1) * num_samples_per_rank))
-    
+                index_mapping[dp_rank] = list(range(dp_rank * num_samples_per_dp, (dp_rank + 1) * num_samples_per_dp))
+
     print(f"dispatch_dynamic_index_data_proto: {index_mapping=}")
-    # Validate mapping covers all workers
-    expected_ranks = set(range(worker_group.world_size))
+    # Validate mapping covers all dp_ranks
+    expected_ranks = set(range(num_dp_groups))
     provided_ranks = set(index_mapping.keys())
     if expected_ranks != provided_ranks:
         raise ValueError(f"Index mapping must cover all DP ranks. Expected: {expected_ranks}, Got: {provided_ranks}")
-    
+
+    # Split args: each worker gets the chunk for its dp_rank
     splitted_args = []
     for arg in args:
         assert isinstance(arg, (DataProto, DataProtoFuture, BatchMeta))
         chunks = []
-        for dp_rank in range(worker_group.world_size):
+        for worker_idx in range(worker_group.world_size):
+            dp_rank = dp_rank_mapping[worker_idx]
             indices = index_mapping[dp_rank]
             if len(indices) == 0:
-                # Create empty chunk with proper structure
                 chunk = arg.select_idxs([])
             else:
                 chunk = arg.select_idxs(indices)
@@ -509,7 +525,8 @@ def dispatch_dynamic_index_data_proto(worker_group, *args, **kwargs):
     for key, val in kwargs.items():
         assert isinstance(val, (DataProto, DataProtoFuture, BatchMeta))
         chunks = []
-        for dp_rank in range(worker_group.world_size):
+        for worker_idx in range(worker_group.world_size):
+            dp_rank = dp_rank_mapping[worker_idx]
             indices = index_mapping[dp_rank]
             if len(indices) == 0:
                 chunk = val.select_idxs([])
@@ -520,11 +537,41 @@ def dispatch_dynamic_index_data_proto(worker_group, *args, **kwargs):
 
     return splitted_args, splitted_kwargs
 
+
+def collect_dynamic_index_data_proto(worker_group, output):
+    """Collect with is_collect filtering for heterogeneous TP.
+
+    Only keeps outputs from workers where is_collect=True (TP leaders).
+    Falls back to keeping all outputs if no collect info is registered.
+    """
+    import ray
+    from verl.single_controller.base.worker_group import WorkerGroup
+    from verl.protocol import DataProto
+
+    assert isinstance(worker_group, WorkerGroup)
+
+    # Lazily query collect mask
+    if "rollout" not in worker_group._collect_info:
+        worker_group._collect_info["rollout"] = worker_group._query_collect_info("rollout")
+    collect_mask = worker_group._collect_info.get("rollout", None)
+
+    if collect_mask is not None:
+        filtered = [o for o, keep in zip(output, collect_mask) if keep]
+    else:
+        filtered = list(output)
+
+    for o in filtered:
+        assert isinstance(o, DataProto | ray.ObjectRef), (
+            f"expecting DataProto or ObjectRef, got {type(o)}"
+        )
+    return _concat_data_proto_or_future(filtered)
+
+
 def make_dynamic_index_dispatch_fn():
     """Factory function to create the dispatch mode"""
     return {
         "dispatch_fn": dispatch_dynamic_index_data_proto,
-        "collect_fn": collect_dp_compute_data_proto,
+        "collect_fn": collect_dynamic_index_data_proto,
     }
 
 # Register the dispatch mode globally

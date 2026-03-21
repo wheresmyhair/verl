@@ -353,7 +353,13 @@ class ActorRolloutRefWorker(Worker):
     # ==================================================================
 
     def _build_rollout(self, trust_remote_code=False):
-        """Build vLLM rollout — each worker is its own DP rank."""
+        """Build rollout engine — delegates to heterogeneous path if tp_groups is set."""
+        tp_groups = self.config.rollout.get("tp_groups", None)
+        if tp_groups is not None:
+            tp_groups = [list(g) for g in tp_groups]
+            return self._build_rollout_heterogeneous(tp_groups, trust_remote_code)
+
+        # ── Homogeneous TP path (existing) ──
         from torch.distributed.device_mesh import init_device_mesh
         from verl.utils.config import omega_conf_to_dataclass
         from verl.workers.config import HFModelConfig, RolloutConfig
@@ -401,6 +407,103 @@ class ActorRolloutRefWorker(Worker):
             device_mesh=rollout_device_mesh,
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
+
+    def _build_rollout_heterogeneous(self, tp_groups, trust_remote_code=False):
+        """Build SGLang rollout with heterogeneous TP groups.
+
+        Args:
+            tp_groups: list of lists, e.g. [[0,1],[2],[3]].
+                       Each sublist is a TP group of global ranks.
+        """
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import HFModelConfig
+        from verl.workers.torch_pp.het_device_mesh import FakeDeviceMesh, FakeDeviceMeshDim
+        from verl.workers.torch_pp.het_sglang_rollout import HetSGLangRollout
+
+        rollout_config = omega_conf_to_dataclass(self.config.rollout)
+        model_config = omega_conf_to_dataclass(
+            self.config.model, dataclass_type=HFModelConfig,
+        )
+
+        my_rank = self.pp_rank
+        num_dp_groups = len(tp_groups)
+
+        # 1. Find this rank's TP group
+        my_group_ranks = None
+        my_dp_rank = None
+        my_tp_local_rank = None
+        for dp_rank, group_ranks in enumerate(tp_groups):
+            if my_rank in group_ranks:
+                my_group_ranks = group_ranks
+                my_dp_rank = dp_rank
+                my_tp_local_rank = group_ranks.index(my_rank)
+                break
+        assert my_group_ranks is not None, (
+            f"Rank {my_rank} not found in tp_groups {tp_groups}"
+        )
+
+        my_tp_size = len(my_group_ranks)
+        is_tp_leader = my_tp_local_rank == 0
+        dp_leaders = [group[0] for group in tp_groups]
+
+        devices_keyword = "CUDA_VISIBLE_DEVICES"
+        my_cuda_devices = os.environ.get(devices_keyword, "")
+        logger.info(
+            f"[Het TP] rank={my_rank} group={my_group_ranks} "
+            f"tp_rank={my_tp_local_rank} tp_size={my_tp_size} "
+            f"dp_rank={my_dp_rank} is_leader={is_tp_leader} "
+            f"CUDA_VISIBLE_DEVICES={my_cuda_devices}"
+        )
+
+        # 2. Create process groups (collective — all ranks participate in every call)
+        tp_pg_map = {}
+        for group_ranks in tp_groups:
+            pg = dist.new_group(ranks=group_ranks, backend="gloo")
+            for r in group_ranks:
+                tp_pg_map[r] = pg
+        my_tp_pg = tp_pg_map[my_rank]
+
+        # DP leaders group (for future use, e.g. DP-level allreduce)
+        dp_pg = dist.new_group(ranks=dp_leaders, backend="gloo")
+
+        # 3. Build FakeDeviceMesh instances
+        tp_dim = FakeDeviceMeshDim(my_group_ranks, my_tp_local_rank, my_tp_pg)
+        pp_dim = FakeDeviceMeshDim([my_rank], 0, None)  # trivial, no collectives
+        dp_dim = FakeDeviceMeshDim(dp_leaders, my_dp_rank, dp_pg)
+
+        rollout_device_mesh = FakeDeviceMesh(
+            dim_map={"infer_tp": tp_dim, "infer_pp": pp_dim, "dp": dp_dim},
+            rank=my_rank,
+        )
+        cpu_device_mesh = FakeDeviceMesh(
+            dim_map={"tp": tp_dim, "pp": pp_dim, "dp": dp_dim},
+            rank=my_rank,
+        )
+
+        # 4. Register dispatch/collect info
+        self._register_dispatch_collect_info(
+            "rollout", dp_rank=my_dp_rank, is_collect=is_tp_leader,
+        )
+
+        # 5. Random states (seeded by dp_rank for reproducibility within DP group)
+        self.torch_random_states = get_torch_device().get_rng_state()
+        get_torch_device().manual_seed(my_dp_rank + 1000)
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
+
+        # 6. Override config tp_size for this group
+        rollout_config.tensor_model_parallel_size = my_tp_size
+
+        # 7. Build heterogeneous SGLang rollout
+        log_gpu_memory_usage("Before building het SGLang rollout", logger=logger)
+        self.rollout = HetSGLangRollout(
+            config=rollout_config,
+            model_config=model_config,
+            device_mesh=rollout_device_mesh,
+            device_mesh_cpu=cpu_device_mesh,
+            tp_groups=tp_groups,
+        )
+        log_gpu_memory_usage("After building het SGLang rollout", logger=logger)
 
     # ==================================================================
     # NCCL P2P warmup

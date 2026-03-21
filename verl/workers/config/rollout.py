@@ -93,7 +93,7 @@ class ServerConfig(BaseConfig):
 
 @dataclass
 class RolloutConfig(BaseConfig):
-    _mutable_fields = {"max_model_len", "load_format"}
+    _mutable_fields = {"max_model_len", "load_format", "tensor_model_parallel_size"}
 
     name: Optional[str] = MISSING
     mode: str = "sync"
@@ -171,6 +171,8 @@ class RolloutConfig(BaseConfig):
     layered_summon: bool = False
 
     layer_name_map: dict = field(default_factory=dict)
+
+    tp_groups: Optional[list] = None  # e.g. [[0,1],[2],[3]] for heterogeneous TP
 
     sglang_engine_mode: str = "local"
 

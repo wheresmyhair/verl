@@ -1220,10 +1220,12 @@ class RayPPOTrainer:
                                         estimated_lengths_this_batch.append(1024)
                                 print(f"estimated_lengths_this_batch: {estimated_lengths_this_batch}")
                                 # 2. rebalance
-                                balancer = SampleLengthBalancer(num_workers=self.actor_rollout_wg.world_size)
+                                tp_groups = self.config.actor_rollout_ref.rollout.get("tp_groups", None)
+                                num_rollout_groups = len(tp_groups) if tp_groups else self.actor_rollout_wg.world_size
+                                balancer = SampleLengthBalancer(num_workers=num_rollout_groups)
                                 index_mapping = balancer.balance(estimated_lengths_this_batch)
                                 print(f"index_mapping: {index_mapping}")
-                                balanced_num_samples_per_worker = len(estimated_lengths_this_batch) // self.actor_rollout_wg.world_size
+                                balanced_num_samples_per_worker = len(estimated_lengths_this_batch) // num_rollout_groups
                                 for k,v in index_mapping.items():
                                     print(
                                         f"index mapping rank: {k}, num_samples: "
