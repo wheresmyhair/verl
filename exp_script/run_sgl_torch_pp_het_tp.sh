@@ -43,7 +43,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	algorithm.adv_estimator=grpo \
 	data.train_files=$train_files \
 	data.val_files=$test_files \
-	data.train_batch_size=512 \
+	data.train_batch_size=128 \
 	data.max_prompt_length=1024 \
 	data.max_response_length=1024 \
 	actor_rollout_ref.model.path=$MODEL_PATH \
@@ -73,14 +73,15 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	trainer.logger=['console','wandb'] \
 	trainer.project_name=$YOUR_PROJECT_NAME \
 	trainer.experiment_name=$YOUR_RUN_NAME \
+	trainer.resume_mode=disable \
 	trainer.n_gpus_per_node=$GPUS_PER_NODE \
 	trainer.nnodes=1 \
 	actor_rollout_ref.enable_pp_trace=true \
 	actor_rollout_ref.enable_response_profiling=true \
 	actor_rollout_ref.profiling_save_dir=$PROFILING_DIR \
-	trainer.save_freq=-1 \
+	trainer.save_freq=1 \
 	trainer.test_freq=9999 \
-	trainer.total_epochs=3 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_het_tp.txt
+	trainer.total_epochs=1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_het_tp.txt
 
 # Merge PP traces for Perfetto viewing
 echo "Merging PP traces..."

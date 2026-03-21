@@ -637,6 +637,21 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
+    def _shutdown_dataloader_workers(self):
+        for loader_name in ("train_dataloader", "val_dataloader"):
+            loader = getattr(self, loader_name, None)
+            if loader is None:
+                continue
+            iterator = getattr(loader, "_iterator", None)
+            shutdown_fn = getattr(iterator, "_shutdown_workers", None) if iterator is not None else None
+            if callable(shutdown_fn):
+                try:
+                    shutdown_fn()
+                except Exception as exc:
+                    print(f"Warning: failed to shutdown {loader_name} workers cleanly: {exc}")
+            if hasattr(loader, "_iterator"):
+                loader._iterator = None
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -1601,4 +1616,5 @@ class RayPPOTrainer:
                         # The dataset may be changed after each training batch
                         self.train_dataset.on_batch_end(batch=batch)
         finally:
+            self._shutdown_dataloader_workers()
             logger.close()
