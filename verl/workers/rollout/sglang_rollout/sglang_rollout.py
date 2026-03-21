@@ -778,6 +778,10 @@ class SGLangRollout(BaseRollout):
         response_attention_mask = get_response_mask(
             response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
         )
+        # rlpipe: derive actual response lengths from response mask (before padding)
+        non_tensor_batch["response_lengths"] = np.array(
+            response_attention_mask.sum(dim=-1).tolist(), dtype=object
+        )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid

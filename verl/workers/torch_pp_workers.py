@@ -629,7 +629,9 @@ class ActorRolloutRefWorker(Worker):
         dist.all_gather_object(gathered, local_sd)
         for stage_sd in gathered:
             for name, tensor in stage_sd.items():
-                yield name, tensor
+                # all_gather_object deserializes tensors onto CPU;
+                # SGLang's weight sync expects CUDA tensors for IPC serialization
+                yield name, tensor.to(self.device) if tensor.device.type == "cpu" else tensor
 
     # ==================================================================
     # generate_sequences — matches megatron generate_sequences exactly
