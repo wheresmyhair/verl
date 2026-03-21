@@ -36,6 +36,7 @@ class HetSGLangRollout(SGLangRollout):
     def __init__(self, config, model_config, device_mesh, device_mesh_cpu, tp_groups=None):
         # Store BEFORE super().__init__ which calls _init_distributed_env
         self._het_device_mesh_cpu = device_mesh_cpu
+        self._tp_groups = tp_groups
         super().__init__(config, model_config, device_mesh)
 
     def _init_distributed_env(self, device_mesh_cpu=None, **kwargs):
@@ -49,10 +50,13 @@ class HetSGLangRollout(SGLangRollout):
         self._rank = dist.get_rank()
         self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
         self._tp_size = self._device_mesh_cpu["tp"].size()
+        tp_group = self._device_mesh_cpu["tp"].get_group()
+        if tp_group is None:
+            raise RuntimeError("Het SGLang rollout requires a valid TP process group")
 
         logger.info(
             f"[Het SGLang] rank={self._rank} tp_rank={self._tp_rank} "
-            f"tp_size={self._tp_size}"
+            f"tp_size={self._tp_size} tp_groups={self._tp_groups}"
         )
 
         # Gather visible devices within the TP group.
@@ -67,8 +71,13 @@ class HetSGLangRollout(SGLangRollout):
         dist.all_gather_object(
             visible_devices,
             my_device,
-            self._device_mesh_cpu["tp"].get_group(),
+            tp_group,
         )
+        if any(device is None for device in visible_devices):
+            raise RuntimeError(
+                f"Failed to gather visible devices for het TP group: rank={self._rank}, "
+                f"tp_rank={self._tp_rank}, tp_size={self._tp_size}, visible_devices={visible_devices}"
+            )
         self.visible_devices_set = set(",".join(visible_devices).split(","))
         os.environ[devices_keyword] = ",".join(
             sorted(self.visible_devices_set, key=int)
@@ -97,7 +106,18 @@ class HetSGLangRollout(SGLangRollout):
         os.environ["SGLANG_DIST_BACKEND"] = "gloo"
 
         try:
+            logger.info(
+                "[Het SGLang] starting inference engine init with "
+                f"rank={self._rank} tp_rank={self._tp_rank} tp_size={self._tp_size} "
+                f"visible_devices={sorted(self.visible_devices_set, key=int)}"
+            )
             super()._init_inference_engine(trust_remote_code, actor_module, port)
+        except Exception as exc:
+            raise RuntimeError(
+                "Het SGLang inference engine init failed with "
+                f"rank={self._rank} tp_rank={self._tp_rank} tp_size={self._tp_size} "
+                f"visible_devices={sorted(self.visible_devices_set, key=int)}"
+            ) from exc
         finally:
             # Restore env vars for verl's own use
             os.environ.update(saved)

@@ -192,3 +192,23 @@ class RolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+        if self.tp_groups is not None:
+            if self.name != "sglang":
+                raise ValueError("rollout.tp_groups is currently only supported for rollout.name='sglang'")
+            if not isinstance(self.tp_groups, list) or len(self.tp_groups) == 0:
+                raise ValueError("rollout.tp_groups must be a non-empty list of rank groups")
+
+            flat_ranks = []
+            for idx, group in enumerate(self.tp_groups):
+                if not isinstance(group, list) or len(group) == 0:
+                    raise ValueError(f"rollout.tp_groups[{idx}] must be a non-empty list of ranks")
+                for rank in group:
+                    if not isinstance(rank, int):
+                        raise ValueError(f"rollout.tp_groups[{idx}] contains non-integer rank {rank!r}")
+                    if rank < 0:
+                        raise ValueError(f"rollout.tp_groups[{idx}] contains negative rank {rank}")
+                    flat_ranks.append(rank)
+
+            if len(set(flat_ranks)) != len(flat_ranks):
+                raise ValueError(f"rollout.tp_groups must not contain duplicate ranks: {self.tp_groups!r}")

@@ -84,6 +84,48 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # Offload / load helpers
 # ======================================================================
 
+def _validate_heterogeneous_tp_groups(tp_groups: List[List[int]], world_size: int):
+    """Validate het TP groups before building rollout process groups."""
+    if not tp_groups:
+        raise ValueError("rollout.tp_groups must be a non-empty list")
+
+    seen_ranks = []
+    for idx, group in enumerate(tp_groups):
+        if not group:
+            raise ValueError(f"rollout.tp_groups[{idx}] must not be empty")
+        for rank in group:
+            if rank < 0 or rank >= world_size:
+                raise ValueError(
+                    f"rollout.tp_groups[{idx}] contains rank {rank}, but world_size is {world_size}"
+                )
+            seen_ranks.append(rank)
+
+    missing_ranks = sorted(set(range(world_size)) - set(seen_ranks))
+    duplicate_ranks = sorted({rank for rank in seen_ranks if seen_ranks.count(rank) > 1})
+    if duplicate_ranks:
+        raise ValueError(
+            f"rollout.tp_groups contains duplicate ranks {duplicate_ranks}: {tp_groups!r}"
+        )
+    if missing_ranks:
+        raise ValueError(
+            f"rollout.tp_groups must cover every rollout worker rank exactly once; missing {missing_ranks}"
+        )
+
+
+def _format_het_tp_debug_info(
+    my_rank: int,
+    my_group_ranks: List[int],
+    my_tp_local_rank: int,
+    my_tp_size: int,
+    my_dp_rank: int,
+    is_tp_leader: bool,
+):
+    """Compact rank/group context for het TP log and error messages."""
+    return (
+        f"rank={my_rank} group={my_group_ranks} tp_rank={my_tp_local_rank} "
+        f"tp_size={my_tp_size} dp_rank={my_dp_rank} is_leader={is_tp_leader}"
+    )
+
 def _offload_module(module):
     """Offload module parameters and buffers to CPU."""
     if module is not None:
@@ -425,6 +467,8 @@ class ActorRolloutRefWorker(Worker):
             self.config.model, dataclass_type=HFModelConfig,
         )
 
+        _validate_heterogeneous_tp_groups(tp_groups, self.world_size)
+
         my_rank = self.pp_rank
         num_dp_groups = len(tp_groups)
 
@@ -445,15 +489,13 @@ class ActorRolloutRefWorker(Worker):
         my_tp_size = len(my_group_ranks)
         is_tp_leader = my_tp_local_rank == 0
         dp_leaders = [group[0] for group in tp_groups]
+        debug_info = _format_het_tp_debug_info(
+            my_rank, my_group_ranks, my_tp_local_rank, my_tp_size, my_dp_rank, is_tp_leader
+        )
 
         devices_keyword = "CUDA_VISIBLE_DEVICES"
         my_cuda_devices = os.environ.get(devices_keyword, "")
-        logger.info(
-            f"[Het TP] rank={my_rank} group={my_group_ranks} "
-            f"tp_rank={my_tp_local_rank} tp_size={my_tp_size} "
-            f"dp_rank={my_dp_rank} is_leader={is_tp_leader} "
-            f"CUDA_VISIBLE_DEVICES={my_cuda_devices}"
-        )
+        logger.info(f"[Het TP] {debug_info} CUDA_VISIBLE_DEVICES={my_cuda_devices}")
 
         # 2. Create process groups (collective — all ranks participate in every call)
         tp_pg_map = {}
@@ -496,13 +538,16 @@ class ActorRolloutRefWorker(Worker):
 
         # 7. Build heterogeneous SGLang rollout
         log_gpu_memory_usage("Before building het SGLang rollout", logger=logger)
-        self.rollout = HetSGLangRollout(
-            config=rollout_config,
-            model_config=model_config,
-            device_mesh=rollout_device_mesh,
-            device_mesh_cpu=cpu_device_mesh,
-            tp_groups=tp_groups,
-        )
+        try:
+            self.rollout = HetSGLangRollout(
+                config=rollout_config,
+                model_config=model_config,
+                device_mesh=rollout_device_mesh,
+                device_mesh_cpu=cpu_device_mesh,
+                tp_groups=tp_groups,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to build heterogeneous SGLang rollout for {debug_info}") from exc
         log_gpu_memory_usage("After building het SGLang rollout", logger=logger)
 
     # ==================================================================
@@ -679,7 +724,12 @@ class ActorRolloutRefWorker(Worker):
             if self.config.rollout.get("free_cache_engine", True):
                 await self.rollout.resume(tags=["weights"])
         with simple_timer("rollout_mode/update_weights", _timing):
-            await self.rollout.update_weights(per_tensor_param)
+            try:
+                await self.rollout.update_weights(per_tensor_param)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"rollout.update_weights failed on pp_rank={self.pp_rank}, world_size={self.pp_size}"
+                ) from exc
         with simple_timer("rollout_mode/offload_actor", _timing):
             if self._is_offload_param:
                 _offload_module(self.train_stage)
@@ -774,7 +824,12 @@ class ActorRolloutRefWorker(Worker):
 
         with self._pp_tracer.phase("rollout"):
             with simple_timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sequences(prompts=prompts)
+                try:
+                    output = self.rollout.generate_sequences(prompts=prompts)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"rollout.generate_sequences failed on pp_rank={self.pp_rank}, world_size={self.pp_size}"
+                    ) from exc
         self._pp_tracer.record_hbm("after_rollout")
 
         if self._is_actor:
