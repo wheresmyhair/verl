@@ -78,18 +78,20 @@ class PPTracer:
         self.events: List[Dict] = []
         self._step_start: Optional[float] = None
         self._step: int = 0
+        self._time_offset_us: float = 0.0
 
-    def begin_step(self, step: int):
+    def begin_step(self, step: int, time_offset_us: float = 0.0):
         """Start a new step — clears events and records base timestamp."""
         self.events.clear()
         self._step = step
         self._step_start = time.perf_counter()
+        self._time_offset_us = time_offset_us
 
     def _ts_us(self, t: float) -> float:
         """Convert absolute time to microseconds relative to step start."""
         if self._step_start is None:
             self._step_start = t
-        return (t - self._step_start) * 1e6
+        return self._time_offset_us + (t - self._step_start) * 1e6
 
     # ── Context managers ──
 
@@ -198,8 +200,17 @@ class PPTracer:
 
     def save(self, path: str):
         """Save trace to a JSON file (Chrome/Perfetto format)."""
+        existing_events = []
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    existing_events = loaded
+            except Exception:
+                existing_events = []
         with open(path, "w") as f:
-            json.dump(self.events, f)
+            json.dump(existing_events + self.events, f)
 
     @staticmethod
     def merge_ranks(save_dir: str, step: int, pp_size: int) -> str:

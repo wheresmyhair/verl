@@ -13,6 +13,7 @@ Fused forward (optional): Each GPU holds TWO stages — training at rank r,
 import datetime
 import logging
 import os
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 
@@ -78,6 +79,20 @@ from .torch_pp.comm import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_CHECKPOINT_AUX_FILES = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",
+    "merges.txt",
+    "vocab.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+]
 
 
 # ======================================================================
@@ -174,6 +189,11 @@ def _pp_forward_log_prob(
     pp_pair_groups: dict = None,
     use_fused_loss: bool = True,
     use_remove_padding: bool = False,
+    tracer: Optional[PPTracer] = None,
+    forward_trace_name: str = "infer_forward",
+    recv_trace_name: str = "p2p_recv",
+    send_trace_name: str = "p2p_send",
+    loss_trace_name: str = "loss",
 ):
     """
     Run forward-only PP across all micro-batches and collect log probs
@@ -203,7 +223,11 @@ def _pp_forward_log_prob(
     with torch.no_grad():
         for mb in range(M):
             if stage.is_first:
-                output = stage.forward_step(mb, return_hidden=(use_fused_loss and stage.is_last))
+                if tracer is not None:
+                    with tracer.trace(forward_trace_name, mb):
+                        output = stage.forward_step(mb, return_hidden=(use_fused_loss and stage.is_last))
+                else:
+                    output = stage.forward_step(mb, return_hidden=(use_fused_loss and stage.is_last))
             else:
                 # Activation shape: [1, total_nnz, H] if rmpad, else [micro_B, S, H]
                 nnz = stage._micro_nnz[mb]
@@ -213,31 +237,61 @@ def _pp_forward_log_prob(
                     act_shape = (micro_B, S, hidden_size)
                 hidden_cpu = torch.empty(act_shape, dtype=stage.dtype, device="cpu")
                 pair_group = pp_pair_groups[pp_rank - 1]
-                dist.recv(hidden_cpu, src=pp_rank - 1, group=pair_group)
+                if tracer is not None:
+                    with tracer.trace(recv_trace_name, mb):
+                        dist.recv(hidden_cpu, src=pp_rank - 1, group=pair_group)
+                else:
+                    dist.recv(hidden_cpu, src=pp_rank - 1, group=pair_group)
                 hidden = hidden_cpu.to(device)
-                output = stage.forward_step(mb, hidden, return_hidden=(use_fused_loss and stage.is_last))
+                if tracer is not None:
+                    with tracer.trace(forward_trace_name, mb):
+                        output = stage.forward_step(mb, hidden, return_hidden=(use_fused_loss and stage.is_last))
+                else:
+                    output = stage.forward_step(mb, hidden, return_hidden=(use_fused_loss and stage.is_last))
 
             if stage.is_last:
                 micro_ids = stage._micro_input_ids[mb]  # [1, nnz] or [micro_B, S]
-                if use_fused_loss:
-                    rolled_labels = torch.roll(micro_ids, shifts=-1, dims=-1)
-                    lp, ent = fused.forward(
-                        hidden_states=output,
-                        vocab_weights=stage.lm_head_weight,
-                        input_ids=rolled_labels,
-                        temperature=1.0,
-                    )
-                    all_log_probs.append(lp[:, :-1])
-                    if calculate_entropy:
-                        all_entropys.append(ent[:, :-1])
+                if tracer is not None:
+                    with tracer.trace(loss_trace_name, mb):
+                        if use_fused_loss:
+                            rolled_labels = torch.roll(micro_ids, shifts=-1, dims=-1)
+                            lp, ent = fused.forward(
+                                hidden_states=output,
+                                vocab_weights=stage.lm_head_weight,
+                                input_ids=rolled_labels,
+                                temperature=1.0,
+                            )
+                            all_log_probs.append(lp[:, :-1])
+                            if calculate_entropy:
+                                all_entropys.append(ent[:, :-1])
+                        else:
+                            all_log_probs.append(log_probs_from_logits(output, micro_ids))
+                            if calculate_entropy:
+                                all_entropys.append(entropy_from_logits(output))
                 else:
-                    all_log_probs.append(log_probs_from_logits(output, micro_ids))
-                    if calculate_entropy:
-                        all_entropys.append(entropy_from_logits(output))
+                    if use_fused_loss:
+                        rolled_labels = torch.roll(micro_ids, shifts=-1, dims=-1)
+                        lp, ent = fused.forward(
+                            hidden_states=output,
+                            vocab_weights=stage.lm_head_weight,
+                            input_ids=rolled_labels,
+                            temperature=1.0,
+                        )
+                        all_log_probs.append(lp[:, :-1])
+                        if calculate_entropy:
+                            all_entropys.append(ent[:, :-1])
+                    else:
+                        all_log_probs.append(log_probs_from_logits(output, micro_ids))
+                        if calculate_entropy:
+                            all_entropys.append(entropy_from_logits(output))
             else:
                 out_t = output.detach().contiguous().cpu()
                 pair_group = pp_pair_groups[pp_rank]
-                dist.send(out_t, dst=pp_rank + 1, group=pair_group)
+                if tracer is not None:
+                    with tracer.trace(send_trace_name, mb):
+                        dist.send(out_t, dst=pp_rank + 1, group=pair_group)
+                else:
+                    dist.send(out_t, dst=pp_rank + 1, group=pair_group)
 
     stage.clear_batch_data()
 
@@ -951,6 +1005,7 @@ class ActorRolloutRefWorker(Worker):
                     calculate_entropy=True,
                     pp_pair_groups=self._pp_pair_groups,
                     use_remove_padding=self._use_remove_padding,
+                    tracer=self._pp_tracer,
                 )
         self._pp_tracer.record_hbm("after_compute_log_prob")
 
@@ -992,6 +1047,12 @@ class ActorRolloutRefWorker(Worker):
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
         timing_ref = {}
+        ref_only_trace = self._is_ref and not self._is_actor
+        if ref_only_trace:
+            self._step_counter += 1
+            trace_offset_us = float(data.meta_info.get("trace_time_offset_us", 0.0))
+            self._pp_tracer.begin_step(self._step_counter, time_offset_us=trace_offset_us)
+        self._pp_tracer.record_hbm("before_compute_ref_log_prob")
 
         # Pair groups were created in init_model (before vLLM init)
         assert self._pp_pair_groups is not None, "PP pair groups not initialized"
@@ -1030,7 +1091,9 @@ class ActorRolloutRefWorker(Worker):
                     calculate_entropy=False,
                     pp_pair_groups=self._pp_pair_groups,
                     use_remove_padding=self._use_remove_padding,
-            )
+                    tracer=self._pp_tracer,
+                )
+        self._pp_tracer.record_hbm("after_compute_ref_log_prob")
 
         if self.ref_stage.is_last:
             response_mask = data.batch["response_mask"]
@@ -1054,6 +1117,8 @@ class ActorRolloutRefWorker(Worker):
         output.meta_info["timing"] = {
             f"compute_ref_log_prob/{k}": v for k, v in timing_ref.items()
         }
+        if ref_only_trace:
+            self._pp_tracer.end_step()
         return output
 
     # ==================================================================
@@ -1541,10 +1606,82 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage("After offload during load_checkpoint", logger=logger)
             return
 
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.join(os.getcwd(), checkpoint_path)
+
+        model_path = None
+        safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
+        torch_path = os.path.join(checkpoint_path, "model.pt")
+        if os.path.exists(safetensors_path):
+            from safetensors.torch import load_file
+
+            model_state = load_file(safetensors_path, device="cpu")
+            model_path = safetensors_path
+        elif os.path.exists(torch_path):
+            model_state = torch.load(torch_path, map_location="cpu")
+            model_path = torch_path
+        else:
+            raise FileNotFoundError(f"No checkpoint model file found under {checkpoint_path}")
+
+        if self.train_stage is not None:
+            self.train_stage.load_state_dict_from_full(model_state)
+        if self.ref_stage is not None:
+            self.ref_stage.load_state_dict_from_full(model_state)
+
+        if self.optimizer is not None:
+            optim_path = os.path.join(checkpoint_path, f"optimizer_rank{self.pp_rank}.pt")
+            if os.path.exists(optim_path):
+                optimizer_state = torch.load(optim_path, map_location="cpu")
+                self.optimizer.load_state_dict(optimizer_state)
+
+        if self._is_offload_param and self.train_stage is not None:
+            _offload_module(self.train_stage)
+        if getattr(self, "_ref_is_offload_param", False) and self.ref_stage is not None:
+            _offload_module(self.ref_stage)
+        if self._is_offload_optimizer and self.optimizer is not None:
+            _offload_optimizer(self.optimizer)
+
+        dist.barrier()
+        log_gpu_memory_usage(f"After load_checkpoint from {model_path}", logger=logger)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_pretrained_model(self, checkpoint_path, del_local_after_load=True):
         pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
-        pass
+        if self.train_stage is None:
+            return
+
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.join(os.getcwd(), checkpoint_path)
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        local_sd = self.train_stage.get_global_state_dict()
+        gathered = [None] * self.pp_size
+        dist.all_gather_object(gathered, local_sd)
+
+        if self.pp_rank == 0:
+            merged_state = {}
+            for stage_sd in gathered:
+                merged_state.update(stage_sd)
+
+            try:
+                from safetensors.torch import save_file
+
+                save_file(merged_state, os.path.join(checkpoint_path, "model.safetensors"))
+            except Exception:
+                torch.save(merged_state, os.path.join(checkpoint_path, "model.pt"))
+
+            if self.local_path is not None and os.path.isdir(self.local_path):
+                for filename in _CHECKPOINT_AUX_FILES:
+                    src = os.path.join(self.local_path, filename)
+                    dst = os.path.join(checkpoint_path, filename)
+                    if os.path.exists(src) and not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+
+        if self.optimizer is not None:
+            optimizer_state = self.optimizer.state_dict()
+            torch.save(optimizer_state, os.path.join(checkpoint_path, f"optimizer_rank{self.pp_rank}.pt"))
+
+        dist.barrier()
