@@ -265,6 +265,183 @@ class SampleLengthBalancer:
         print(f"{'='*60}\n")
 
 
+class RolloutRouter:
+    """Compute per-DP-rank routing for heterogeneous rollout groups."""
+
+    def __init__(
+        self,
+        num_workers: int,
+        strategy: str = "round_robin",
+        worker_weights: Optional[List[float]] = None,
+        prompt_coef: float = 1.0,
+        response_coef: float = 4.0,
+        default_response_length: float = 1024.0,
+        warmup_epochs: int = 1,
+        random_seed: int = 0,
+        history_estimator: str = "mean",
+        ema_alpha: float = 0.5,
+        response_agg: str = "max",
+    ):
+        if num_workers <= 0:
+            raise ValueError("num_workers must be positive")
+        self.num_workers = num_workers
+        self.strategy = strategy
+        self.worker_weights = worker_weights or [1.0] * num_workers
+        if len(self.worker_weights) != num_workers:
+            raise ValueError(
+                f"worker_weights length {len(self.worker_weights)} must match num_workers {num_workers}"
+            )
+        self.prompt_coef = float(prompt_coef)
+        self.response_coef = float(response_coef)
+        self.default_response_length = float(default_response_length)
+        self.warmup_epochs = int(warmup_epochs)
+        self.random_seed = int(random_seed)
+        self.history_estimator = history_estimator
+        self.ema_alpha = float(ema_alpha)
+        self.response_agg = response_agg
+        self.sample_history_estimates: Dict[int, float] = {}
+        self.sample_history_counts: Dict[int, int] = {}
+
+    @staticmethod
+    def _infer_worker_weights(num_workers: int, tp_groups: Optional[List[List[int]]], configured_weights) -> List[float]:
+        if configured_weights is not None:
+            weights = [float(w) for w in configured_weights]
+            if len(weights) != num_workers:
+                raise ValueError(
+                    f"rollout.routing_group_weights has length {len(weights)}, expected {num_workers}"
+                )
+            return weights
+        if tp_groups is not None:
+            return [float(len(group)) for group in tp_groups]
+        return [1.0] * num_workers
+
+    @staticmethod
+    def _aggregate_response_lengths(lengths: List[float], method: str) -> float:
+        if not lengths:
+            return 0.0
+        arr = np.asarray(lengths, dtype=np.float32)
+        if method == "mean":
+            return float(arr.mean())
+        if method == "max":
+            return float(arr.max())
+        if method.startswith("p"):
+            try:
+                q = float(method[1:])
+            except ValueError as exc:
+                raise ValueError(f"Invalid response aggregation quantile: {method}") from exc
+            return float(np.percentile(arr, q))
+        raise ValueError(f"Unknown response aggregation method: {method}")
+
+    def _history_response_length(self, sample_idx: int) -> float:
+        return float(self.sample_history_estimates.get(sample_idx, self.default_response_length))
+
+    def _score_samples(
+        self,
+        sample_indices,
+        prompt_lengths,
+    ) -> List[float]:
+        scores = []
+        for sample_idx, prompt_len in zip(sample_indices, prompt_lengths, strict=True):
+            est_resp_len = self._history_response_length(sample_idx)
+            score = self.prompt_coef * float(prompt_len) + self.response_coef * est_resp_len
+            scores.append(score)
+        return scores
+
+    def _weighted_greedy_assign(self, scores: List[float]):
+        indexed_scores = [(float(score), idx) for idx, score in enumerate(scores)]
+        indexed_scores.sort(reverse=True)
+
+        loads = [0.0] * self.num_workers
+        assignment = {worker_id: [] for worker_id in range(self.num_workers)}
+
+        for score, request_idx in indexed_scores:
+            best_worker = min(
+                range(self.num_workers),
+                key=lambda worker_id: (loads[worker_id] / max(self.worker_weights[worker_id], 1e-6), worker_id),
+            )
+            assignment[best_worker].append(request_idx)
+            loads[best_worker] += score
+
+        self._print_assignment(assignment, loads)
+        return assignment, loads
+
+    def _print_assignment(self, assignment: Dict[int, List[int]], loads: List[float]):
+        print(f"\n{'='*60}")
+        print(f"Rollout Routing ({self.strategy})")
+        print(f"{'='*60}")
+        for worker_id in range(self.num_workers):
+            norm_load = loads[worker_id] / max(self.worker_weights[worker_id], 1e-6)
+            print(
+                f"Worker {worker_id}: weight={self.worker_weights[worker_id]:.2f}, "
+                f"raw_load={loads[worker_id]:.1f}, norm_load={norm_load:.1f}, "
+                f"num_samples={len(assignment[worker_id])}"
+            )
+        print(f"{'='*60}\n")
+
+    def route(
+        self,
+        *,
+        sample_indices,
+        prompt_lengths,
+        epoch: int,
+    ):
+        batch_size = len(sample_indices)
+        if batch_size == 0:
+            return {i: [] for i in range(self.num_workers)}, {"predicted_loads": [0.0] * self.num_workers}
+
+        strategy = self.strategy
+        if epoch < self.warmup_epochs and strategy not in {"round_robin", "random"}:
+            strategy = "round_robin"
+
+        if strategy == "round_robin":
+            assignment = {worker_id: list(range(worker_id, batch_size, self.num_workers)) for worker_id in range(self.num_workers)}
+            loads = [sum(float(prompt_lengths[idx]) for idx in assignment[worker_id]) for worker_id in range(self.num_workers)]
+            return assignment, {"predicted_loads": loads, "strategy": strategy}
+
+        if strategy == "random":
+            rng = np.random.RandomState(self.random_seed + epoch)
+            assignment = {worker_id: [] for worker_id in range(self.num_workers)}
+            for idx in range(batch_size):
+                assignment[int(rng.randint(0, self.num_workers))].append(idx)
+            loads = [sum(float(prompt_lengths[idx]) for idx in assignment[worker_id]) for worker_id in range(self.num_workers)]
+            return assignment, {"predicted_loads": loads, "strategy": strategy}
+
+        if strategy in {"length", "prompt_length", "response_length", "weighted_response_length"}:
+            if strategy == "prompt_length":
+                scores = [float(x) for x in prompt_lengths]
+            elif strategy == "response_length":
+                scores = [self._history_response_length(sample_idx) for sample_idx in sample_indices]
+            else:
+                scores = self._score_samples(
+                    sample_indices=sample_indices,
+                    prompt_lengths=prompt_lengths,
+                )
+            assignment, loads = self._weighted_greedy_assign(scores)
+            return assignment, {"predicted_loads": loads, "strategy": strategy, "predicted_scores": scores}
+
+        raise ValueError(f"Unknown rollout routing strategy: {self.strategy}")
+
+    def update_history(self, sample_to_lengths: Dict[int, List[float]]):
+        aggregated = {}
+        for sample_idx, lengths in sample_to_lengths.items():
+            aggregated[sample_idx] = self._aggregate_response_lengths(lengths, self.response_agg)
+
+        for sample_idx, value in aggregated.items():
+            prev = self.sample_history_estimates.get(sample_idx, None)
+            if self.history_estimator == "latest" or prev is None:
+                self.sample_history_estimates[sample_idx] = float(value)
+            elif self.history_estimator == "mean":
+                count = self.sample_history_counts.get(sample_idx, 1)
+                self.sample_history_estimates[sample_idx] = (prev * count + float(value)) / (count + 1)
+            elif self.history_estimator == "ema":
+                self.sample_history_estimates[sample_idx] = self.ema_alpha * float(value) + (1.0 - self.ema_alpha) * prev
+            else:
+                raise ValueError(f"Unknown routing history estimator: {self.history_estimator}")
+            self.sample_history_counts[sample_idx] = self.sample_history_counts.get(sample_idx, 0) + 1
+
+        return aggregated
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -1258,7 +1435,26 @@ class RayPPOTrainer:
 
             sample_lengths = {k: [[] for _ in range(self.config.trainer.total_epochs)] for k in range(len(self.train_dataset))} # rlpipe modification
             # {sample_idx: [[lengths_ep0_n0, lengths_ep0_n1, ...], [lengths_ep1_n0, lengths_ep1_n1, ...], ...]}
-            response_length_balance = True # rlpipe modification
+            tp_groups = self.config.actor_rollout_ref.rollout.get("tp_groups", None)
+            num_rollout_groups = len(tp_groups) if tp_groups else self.actor_rollout_wg.world_size
+            routing_cfg = self.config.actor_rollout_ref.rollout
+            router = RolloutRouter(
+                num_workers=num_rollout_groups,
+                strategy=routing_cfg.get("routing_strategy", "round_robin"),
+                worker_weights=RolloutRouter._infer_worker_weights(
+                    num_workers=num_rollout_groups,
+                    tp_groups=tp_groups,
+                    configured_weights=routing_cfg.get("routing_group_weights", None),
+                ),
+                prompt_coef=routing_cfg.get("routing_prompt_coef", 1.0),
+                response_coef=routing_cfg.get("routing_response_coef", 4.0),
+                default_response_length=routing_cfg.get("routing_default_response_length", 1024.0),
+                warmup_epochs=routing_cfg.get("routing_warmup_epochs", 1),
+                random_seed=routing_cfg.get("routing_random_seed", 0),
+                history_estimator=routing_cfg.get("routing_history_estimator", "mean"),
+                ema_alpha=routing_cfg.get("routing_ema_alpha", 0.5),
+                response_agg=routing_cfg.get("routing_response_agg", "max"),
+            )
             for epoch in range(self.config.trainer.total_epochs):
                 for batch_dict in self.train_dataloader:
                     metrics = {}
@@ -1294,49 +1490,74 @@ class RayPPOTrainer:
                         # generate a batch
                         with marked_timer("gen", timing_raw, color="red"), self._trainer_phase("gen"):
                             if not self.async_rollout_mode:
-                                
                                 print(f"{gen_batch_output=}")
-                                    
-                                if epoch != 0 and response_length_balance: # rlpipe modification
-                                    # if epoch == 0, samples are being evenly distributed to dp ranks
-                                    # if epoch != 0, samples are being balanced based on response lengths in the previous epoch
-                                    # example: index_mapping = {0: [0, ], 1: [1,2,3]} # -> the 0th sample IN THIS GEN_BATCH_OUTPUT is mapped to dp rank 0, vise versa.
-                                    # 1. get lengths in this batch
-                                    sample_idx_this_batch = gen_batch_output.non_tensor_batch["index"]
-                                    print(f"sample_idx_this_batch: {sample_idx_this_batch}")
-                                    estimated_lengths_this_batch = []
-                                    for sample_idx in sample_idx_this_batch:
-                                        # since we drop last incomplete batch, there's chance that there's no length for this sample in the previous epoch
-                                        # try to find the last length for this sample
-                                        length_found = False
-                                        for length in sample_lengths[sample_idx][:epoch][::-1]:
-                                            if length:
-                                                estimated_lengths_this_batch.append(np.mean(length))
-                                                length_found = True
-                                                break
-                                        if not length_found:
-                                            estimated_lengths_this_batch.append(1024)
-                                    print(f"estimated_lengths_this_batch: {estimated_lengths_this_batch}")
-                                    # 2. rebalance
-                                    tp_groups = self.config.actor_rollout_ref.rollout.get("tp_groups", None)
-                                    num_rollout_groups = len(tp_groups) if tp_groups else self.actor_rollout_wg.world_size
-                                    balancer = SampleLengthBalancer(num_workers=num_rollout_groups)
-                                    index_mapping = balancer.balance(estimated_lengths_this_batch)
-                                    print(f"index_mapping: {index_mapping}")
-                                    balanced_num_samples_per_worker = len(estimated_lengths_this_batch) // num_rollout_groups
-                                    for k,v in index_mapping.items():
-                                        print(
-                                            f"index mapping rank: {k}, num_samples: "
-                                            f"balanced: {len(v)}; "
-                                            f"original: {sum(estimated_lengths_this_batch[k*balanced_num_samples_per_worker:(k+1)*balanced_num_samples_per_worker])}"
-                                        )
-                                    gen_batch_output.meta_info['dp_index_mapping'] = index_mapping
-                                    
+                                sample_idx_this_batch = list(gen_batch_output.non_tensor_batch["index"])
+                                prompt_lengths_this_batch = []
+                                if "raw_prompt_ids" in gen_batch_output.non_tensor_batch:
+                                    prompt_lengths_this_batch = [
+                                        len(prompt_ids) if hasattr(prompt_ids, "__len__") else 0
+                                        for prompt_ids in gen_batch_output.non_tensor_batch["raw_prompt_ids"]
+                                    ]
+                                elif "prompts" in gen_batch_output.batch:
+                                    prompt_lengths_this_batch = (
+                                        gen_batch_output.batch["prompts"].ne(0).sum(dim=-1).cpu().tolist()
+                                    )
+                                elif "attention_mask" in gen_batch_output.batch and "response_mask" in gen_batch_output.batch:
+                                    prompt_lengths_this_batch = (
+                                        gen_batch_output.batch["attention_mask"].sum(dim=-1)
+                                        - gen_batch_output.batch["response_mask"].sum(dim=-1)
+                                    ).cpu().tolist()
+                                else:
+                                    prompt_lengths_this_batch = [0.0] * len(sample_idx_this_batch)
+
+                                index_mapping, routing_info = router.route(
+                                    sample_indices=sample_idx_this_batch,
+                                    prompt_lengths=prompt_lengths_this_batch,
+                                    epoch=epoch,
+                                )
+                                print(f"sample_idx_this_batch: {sample_idx_this_batch}")
+                                print(f"prompt_lengths_this_batch: {prompt_lengths_this_batch}")
+                                print(f"index_mapping: {index_mapping}")
+                                gen_batch_output.meta_info['dp_index_mapping'] = index_mapping
+                                predicted_loads = routing_info.get("predicted_loads", [0.0] * num_rollout_groups)
+                                for group_id, load in enumerate(predicted_loads):
+                                    metrics[f"routing/predicted_load/group_{group_id}"] = float(load)
+                                    metrics[f"routing/predicted_norm_load/group_{group_id}"] = float(
+                                        load / max(router.worker_weights[group_id], 1e-6)
+                                    )
+
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                                 
                                 print(f"after generate_sequences: {gen_batch_output=}")
+                                sample_to_lengths = defaultdict(list)
+                                realized_group_loads = [0.0] * num_rollout_groups
                                 for idx, sample_idx in enumerate(gen_batch_output.non_tensor_batch["index"]): # the global sample index across all datasets.
-                                    sample_lengths[sample_idx][epoch].append(gen_batch_output.non_tensor_batch["response_lengths"][idx])
+                                    response_len = float(gen_batch_output.non_tensor_batch["response_lengths"][idx])
+                                    sample_lengths[sample_idx][epoch].append(response_len)
+                                    sample_to_lengths[sample_idx].append(response_len)
+                                    for group_id, routed_indices in index_mapping.items():
+                                        if idx in routed_indices:
+                                            realized_group_loads[group_id] += response_len
+                                            break
+                                aggregated_lengths = router.update_history(sample_to_lengths)
+                                for group_id, load in enumerate(realized_group_loads):
+                                    metrics[f"routing/realized_response_load/group_{group_id}"] = float(load)
+                                    metrics[f"routing/realized_response_norm_load/group_{group_id}"] = float(
+                                        load / max(router.worker_weights[group_id], 1e-6)
+                                    )
+                                if predicted_loads:
+                                    predicted_norm = [load / max(w, 1e-6) for load, w in zip(predicted_loads, router.worker_weights, strict=True)]
+                                    metrics["routing/predicted_imbalance_ratio"] = (
+                                        (max(predicted_norm) - min(predicted_norm)) / max(predicted_norm)
+                                        if max(predicted_norm) > 0 else 0.0
+                                    )
+                                realized_norm = [load / max(w, 1e-6) for load, w in zip(realized_group_loads, router.worker_weights, strict=True)]
+                                metrics["routing/realized_imbalance_ratio"] = (
+                                    (max(realized_norm) - min(realized_norm)) / max(realized_norm)
+                                    if max(realized_norm) > 0 else 0.0
+                                )
+                                if aggregated_lengths:
+                                    metrics["routing/history_samples_updated"] = float(len(aggregated_lengths))
                                 print(f"sample_lengths: {sample_lengths}")
                             else:
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)

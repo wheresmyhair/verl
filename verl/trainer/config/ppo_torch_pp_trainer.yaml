@@ -32,6 +32,16 @@ actor_rollout_ref:
 
   rollout:
     tp_groups: null  # e.g. [[0,1],[2],[3]] for heterogeneous TP
+    routing_strategy: round_robin  # round_robin | random | length | prompt_length | response_length | weighted_response_length
+    routing_warmup_epochs: 1
+    routing_prompt_coef: 1.0
+    routing_response_coef: 4.0
+    routing_default_response_length: 1024.0
+    routing_history_estimator: mean  # latest | mean | ema
+    routing_ema_alpha: 0.5
+    routing_response_agg: max  # mean | max | p80 | p90 | ...
+    routing_group_weights: null  # defaults to TP sizes when tp_groups is set
+    routing_random_seed: 0
     layer_name_map:
       qkv_layer_name: qkv
       gate_proj_layer_name: gate_up
