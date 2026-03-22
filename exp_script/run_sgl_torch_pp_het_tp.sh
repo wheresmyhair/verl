@@ -1,11 +1,10 @@
 #!/bin/bash
-# Torch naive PP experiment with heterogeneous TP SGLang rollout
-# GPU 0+1 share TP=2 engine, GPU 2 and 3 each TP=1 → 3 DP groups
+# Het TP + fused forward: routing with tp_groups=[2,1,1], fused forward enabled
 set -x
 rm -f log_rank_*.txt
 
 # Backup and clean previous profiling data
-PROFILING_DIR=/home/user/profiling
+PROFILING_DIR=/home/user/profiling_het_tp
 if [ -d "$PROFILING_DIR" ]; then
     BACKUP_DIR="${PROFILING_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
     echo "Backing up previous profiling data to $BACKUP_DIR"
@@ -14,9 +13,7 @@ fi
 mkdir -p "$PROFILING_DIR"
 
 # setup environment
-# Heterogeneous TP now uses a helper-backed SGLang server on TP leaders.
-# Keep Ray's default per-worker GPU isolation so parent workers do not
-# create stray CUDA contexts on unrelated GPUs.
+# Keep Ray's default per-worker GPU isolation for het TP
 unset RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
 
 GPUS_PER_NODE=4
@@ -56,7 +53,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.actor.grad_clip=1.0 \
 	actor_rollout_ref.actor.param_offload=True \
 	actor_rollout_ref.actor.optimizer_offload=True \
-	actor_rollout_ref.actor.fused_forward=False \
+	actor_rollout_ref.actor.fused_forward=True \
 	actor_rollout_ref.actor.num_micro_batches=32 \
 	actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
 	actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -64,6 +61,8 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 	actor_rollout_ref.rollout.n=5 \
 	actor_rollout_ref.rollout.tp_groups='[[0,1],[2],[3]]' \
+	actor_rollout_ref.rollout.routing_strategy=length \
+	actor_rollout_ref.rollout.routing_warmup_epochs=1 \
 	actor_rollout_ref.nccl_timeout=60 \
 	actor_rollout_ref.rollout.enable_chunked_prefill=False \
 	+actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=flashinfer \
@@ -79,9 +78,9 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.enable_pp_trace=true \
 	actor_rollout_ref.enable_response_profiling=true \
 	actor_rollout_ref.profiling_save_dir=$PROFILING_DIR \
-	trainer.save_freq=1 \
+	trainer.save_freq=-1 \
 	trainer.test_freq=9999 \
-	trainer.total_epochs=1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_het_tp.txt
+	trainer.total_epochs=3 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_het_tp.txt
 
 # Merge PP traces for Perfetto viewing
 echo "Merging PP traces..."

@@ -1,11 +1,10 @@
 #!/bin/bash
-# Torch naive PP experiment with DP=4 SGLang rollout
-# Same setup as run_vllm_torch_pp_dp4.sh but with sglang engine
+# Baseline: homo 4xTP=1, no routing, no fused forward, normal torch PP
 set -x
 rm -f log_rank_*.txt
 
 # Backup and clean previous profiling data
-PROFILING_DIR=/home/user/profiling
+PROFILING_DIR=/home/user/profiling_baseline
 if [ -d "$PROFILING_DIR" ]; then
     BACKUP_DIR="${PROFILING_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
     echo "Backing up previous profiling data to $BACKUP_DIR"
@@ -20,15 +19,13 @@ INFERENCE_BATCH_SIZE=64
 GPU_MEMORY_UTILIZATION=0.7
 
 YOUR_PROJECT_NAME=verl-rollout-optim
-YOUR_RUN_NAME=sgl-torch-pp-dp4
+YOUR_RUN_NAME=sgl-torch-pp-baseline
 
 # setup data
-# keep this since we may change the gsm8k_all.py file
 python3 examples/data_preprocess/gsm8k_all.py --local_dir $HOME/data/gsm8k-$YOUR_RUN_NAME
 
 gsm8k_train_path=$HOME/data/gsm8k-$YOUR_RUN_NAME/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k-$YOUR_RUN_NAME/test.parquet
-
 
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
@@ -40,7 +37,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	algorithm.adv_estimator=grpo \
 	data.train_files=$train_files \
 	data.val_files=$test_files \
-	data.train_batch_size=512 \
+	data.train_batch_size=128 \
 	data.max_prompt_length=1024 \
 	data.max_response_length=1024 \
 	actor_rollout_ref.model.path=$MODEL_PATH \
@@ -69,6 +66,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	trainer.logger=['console','wandb'] \
 	trainer.project_name=$YOUR_PROJECT_NAME \
 	trainer.experiment_name=$YOUR_RUN_NAME \
+	trainer.resume_mode=disable \
 	trainer.n_gpus_per_node=$GPUS_PER_NODE \
 	trainer.nnodes=1 \
 	actor_rollout_ref.enable_pp_trace=true \
@@ -76,7 +74,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.profiling_save_dir=$PROFILING_DIR \
 	trainer.save_freq=-1 \
 	trainer.test_freq=9999 \
-	trainer.total_epochs=3 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_torch_pp.txt
+	trainer.total_epochs=3 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_baseline.txt
 
 # Merge PP traces for Perfetto viewing
 echo "Merging PP traces..."

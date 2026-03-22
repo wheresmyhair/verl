@@ -1,11 +1,10 @@
 #!/bin/bash
-# Torch naive PP experiment with fused forward (inference in training bubbles)
-# Eliminates separate compute_log_prob phase — old_log_probs computed in-band
+# Fused forward: homo 4xTP=1, no routing, fused forward enabled
 set -x
 rm -f log_rank_*.txt
 
 # Backup and clean previous profiling data
-PROFILING_DIR=/home/user/profiling_fused
+PROFILING_DIR=/home/user/profiling_fused_forward
 if [ -d "$PROFILING_DIR" ]; then
     BACKUP_DIR="${PROFILING_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
     echo "Backing up previous profiling data to $BACKUP_DIR"
@@ -14,15 +13,13 @@ fi
 mkdir -p "$PROFILING_DIR"
 
 # setup environment
-unset RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
-
 GPUS_PER_NODE=4
 ENGINE=sglang
 INFERENCE_BATCH_SIZE=64
 GPU_MEMORY_UTILIZATION=0.7
 
 YOUR_PROJECT_NAME=verl-rollout-optim
-YOUR_RUN_NAME=sgl-torch-pp-het-tp-fused-forward
+YOUR_RUN_NAME=sgl-torch-pp-fused-forward
 
 # setup data
 python3 examples/data_preprocess/gsm8k_all.py --local_dir $HOME/data/gsm8k-$YOUR_RUN_NAME
@@ -60,7 +57,6 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.rollout.name=$ENGINE \
 	actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 	actor_rollout_ref.rollout.n=5 \
-	actor_rollout_ref.rollout.tp_groups='[[0,1],[2],[3]]' \
 	actor_rollout_ref.nccl_timeout=60 \
 	actor_rollout_ref.rollout.enable_chunked_prefill=False \
 	+actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=flashinfer \
@@ -76,9 +72,9 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.enable_pp_trace=true \
 	actor_rollout_ref.enable_response_profiling=true \
 	actor_rollout_ref.profiling_save_dir=$PROFILING_DIR \
-	trainer.save_freq=1 \
+	trainer.save_freq=-1 \
 	trainer.test_freq=9999 \
-	trainer.total_epochs=1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_fused_forward.txt
+	trainer.total_epochs=3 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_sgl_fused_forward.txt
 
 # Merge PP traces for Perfetto viewing
 echo "Merging PP traces..."
