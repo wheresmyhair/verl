@@ -15,10 +15,27 @@ import os
 import torch.distributed as dist
 
 from verl.utils.device import get_visible_devices_keyword
+from verl.workers.rollout.sglang_rollout import http_server_engine as _engine_mod
 from verl.workers.rollout.sglang_rollout.http_server_engine import AsyncHttpServerAdapter
 from verl.workers.rollout.sglang_rollout.sglang_rollout import SGLangRollout
 
+import torch
+
 logger = logging.getLogger(__name__)
+
+# GPUs where NCCL P2P over PCIe hangs during TP>1 init.
+# On these GPUs we disable P2P and custom all-reduce.
+_P2P_BROKEN_GPU_PATTERNS = ("PRO 6000",)
+
+
+def _needs_p2p_workaround() -> bool:
+    """Check if the current GPU needs NCCL P2P disabled."""
+    try:
+        name = torch.cuda.get_device_name(0)
+        return any(pat in name for pat in _P2P_BROKEN_GPU_PATTERNS)
+    except Exception:
+        return False
+
 
 # verl's distributed env vars that SGLang children must NOT inherit
 _DIST_ENV_VARS = (
@@ -93,11 +110,25 @@ class HetSGLangRollout(SGLangRollout):
             if val is not None:
                 saved[key] = val
 
-        # Use gloo for SGLang's internal TP process group init.
-        # NCCL init_process_group from spawned children hangs on some GPUs
-        # (e.g. Blackwell). Gloo works. SGLang's actual tensor ops use
-        # custom CUDA allreduce, not the process group backend.
-        os.environ["SGLANG_DIST_BACKEND"] = "gloo"
+        # On GPUs with broken P2P (e.g. RTX PRO 6000 Blackwell over PCIe),
+        # NCCL init_process_group and custom all-reduce hang during TP>1.
+        # Monkey-patch launch_server to set NCCL_P2P_DISABLE=1 INSIDE the
+        # child process tree, and disable custom all-reduce.
+        _orig_launch = None
+        _disable_p2p = self._tp_size > 1 and _needs_p2p_workaround()
+        if _disable_p2p:
+            _orig_launch = _engine_mod.launch_server
+
+            def _launch_with_p2p_disable(server_args):
+                os.environ["NCCL_P2P_DISABLE"] = "1"
+                return _orig_launch(server_args)
+
+            _engine_mod.launch_server = _launch_with_p2p_disable
+            logger.info(
+                "[Het SGLang] Detected %s — patching NCCL_P2P_DISABLE=1 and "
+                "disable_custom_all_reduce for TP=%d",
+                torch.cuda.get_device_name(0), self._tp_size,
+            )
 
         devices_keyword = get_visible_devices_keyword()
         saved_devices = os.environ.get(devices_keyword, None)
@@ -138,11 +169,13 @@ class HetSGLangRollout(SGLangRollout):
                 "trust_remote_code": trust_remote_code,
                 "max_running_requests": max_running_requests,
                 "port": 30000 + self._rank,
+                "nccl_port": 35000 + self._rank,
                 "log_level": "info",
                 "mm_attention_backend": backend,
                 "attention_backend": backend,
                 "skip_tokenizer_init": self.config.skip_tokenizer_init,
                 "dist_timeout": 1800,
+                "disable_custom_all_reduce": _disable_p2p,
                 "first_rank_in_node": True,
                 # HTTP helper requests should tolerate long rollout batches.
                 # The direct AsyncEngine path does not have this extra client-side
@@ -168,7 +201,9 @@ class HetSGLangRollout(SGLangRollout):
             else:
                 os.environ[devices_keyword] = saved_devices
             os.environ.update(saved)
-            os.environ.pop("SGLANG_DIST_BACKEND", None)
+            # Restore launch_server if we patched it
+            if _orig_launch is not None:
+                _engine_mod.launch_server = _orig_launch
 
     def __del__(self):
         engine = getattr(self, "_engine", None)
