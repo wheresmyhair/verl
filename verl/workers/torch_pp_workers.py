@@ -894,18 +894,27 @@ class ActorRolloutRefWorker(Worker):
             self._pp_tracer.record_hbm("after_unload_rollout")
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
-        # Average timing across all ranks (same as megatron)
-        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
-            timing_generate["generate_sequences"]
-        )
-        timing_generate = reduce_timing(timing_generate)
-        timing_generate.update(
-            {
-                "generation_timing/max": timing_generate_max,
-                "generation_timing/min": timing_generate_min,
-                "generation_timing/topk_ratio": timing_generate_topk_ratio,
-            }
-        )
+        tp_groups = self.config.rollout.get("tp_groups", None)
+        if tp_groups is not None:
+            # Heterogeneous TP can intentionally create long per-group rollout skew.
+            # Avoid post-generation world collectives here: faster workers may reach
+            # the reduction while a slower group is still decoding, which trips the
+            # default process-group timeout. Keep timing metadata present so the
+            # trainer path remains unchanged.
+            timing_generate = {}
+        else:
+            # Average timing across all ranks (same as megatron)
+            timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+                timing_generate["generate_sequences"]
+            )
+            timing_generate = reduce_timing(timing_generate)
+            timing_generate.update(
+                {
+                    "generation_timing/max": timing_generate_max,
+                    "generation_timing/min": timing_generate_min,
+                    "generation_timing/topk_ratio": timing_generate_topk_ratio,
+                }
+            )
         output.meta_info["timing"] = timing_generate
         if torch.distributed.get_rank() == 0:
             print(f"[PROFILING] generate_sequences timing: {timing_generate}")
