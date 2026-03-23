@@ -29,7 +29,7 @@ gsm8k_test_path=$HOME/data/gsm8k-$YOUR_RUN_NAME/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
-MODEL_PATH="Qwen/Qwen3-0.6B"
+MODEL_PATH="Qwen/Qwen3-1.7B"
 
 python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch_pp_trainer' \
 	algorithm.adv_estimator=grpo \

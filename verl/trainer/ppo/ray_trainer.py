@@ -1486,84 +1486,84 @@ class RayPPOTrainer:
                     is_last_step = self.global_steps >= self.total_training_steps
                     if self._trainer_trace is not None:
                         self._trainer_trace.begin_step(self.global_steps)
-                    with marked_timer("step", timing_raw):
-                        # generate a batch
-                        with marked_timer("gen", timing_raw, color="red"), self._trainer_phase("gen"):
-                            if not self.async_rollout_mode:
-                                print(f"{gen_batch_output=}")
-                                sample_idx_this_batch = list(gen_batch_output.non_tensor_batch["index"])
-                                prompt_lengths_this_batch = []
-                                if "raw_prompt_ids" in gen_batch_output.non_tensor_batch:
-                                    prompt_lengths_this_batch = [
-                                        len(prompt_ids) if hasattr(prompt_ids, "__len__") else 0
-                                        for prompt_ids in gen_batch_output.non_tensor_batch["raw_prompt_ids"]
-                                    ]
-                                elif "prompts" in gen_batch_output.batch:
-                                    prompt_lengths_this_batch = (
-                                        gen_batch_output.batch["prompts"].ne(0).sum(dim=-1).cpu().tolist()
-                                    )
-                                elif "attention_mask" in gen_batch_output.batch and "response_mask" in gen_batch_output.batch:
-                                    prompt_lengths_this_batch = (
-                                        gen_batch_output.batch["attention_mask"].sum(dim=-1)
-                                        - gen_batch_output.batch["response_mask"].sum(dim=-1)
-                                    ).cpu().tolist()
-                                else:
-                                    prompt_lengths_this_batch = [0.0] * len(sample_idx_this_batch)
-
-                                index_mapping, routing_info = router.route(
-                                    sample_indices=sample_idx_this_batch,
-                                    prompt_lengths=prompt_lengths_this_batch,
-                                    epoch=epoch,
+                    _step_start = time.time()
+                    # generate a batch
+                    with marked_timer("gen", timing_raw, color="red"), self._trainer_phase("gen"):
+                        if not self.async_rollout_mode:
+                            print(f"{gen_batch_output=}")
+                            sample_idx_this_batch = list(gen_batch_output.non_tensor_batch["index"])
+                            prompt_lengths_this_batch = []
+                            if "raw_prompt_ids" in gen_batch_output.non_tensor_batch:
+                                prompt_lengths_this_batch = [
+                                    len(prompt_ids) if hasattr(prompt_ids, "__len__") else 0
+                                    for prompt_ids in gen_batch_output.non_tensor_batch["raw_prompt_ids"]
+                                ]
+                            elif "prompts" in gen_batch_output.batch:
+                                prompt_lengths_this_batch = (
+                                    gen_batch_output.batch["prompts"].ne(0).sum(dim=-1).cpu().tolist()
                                 )
-                                print(f"sample_idx_this_batch: {sample_idx_this_batch}")
-                                print(f"prompt_lengths_this_batch: {prompt_lengths_this_batch}")
-                                print(f"index_mapping: {index_mapping}")
-                                gen_batch_output.meta_info['dp_index_mapping'] = index_mapping
-                                predicted_loads = routing_info.get("predicted_loads", [0.0] * num_rollout_groups)
-                                for group_id, load in enumerate(predicted_loads):
-                                    metrics[f"routing/predicted_load/group_{group_id}"] = float(load)
-                                    metrics[f"routing/predicted_norm_load/group_{group_id}"] = float(
-                                        load / max(router.worker_weights[group_id], 1e-6)
-                                    )
-
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                                
-                                print(f"after generate_sequences: {gen_batch_output=}")
-                                sample_to_lengths = defaultdict(list)
-                                realized_group_loads = [0.0] * num_rollout_groups
-                                for idx, sample_idx in enumerate(gen_batch_output.non_tensor_batch["index"]): # the global sample index across all datasets.
-                                    response_len = float(gen_batch_output.non_tensor_batch["response_lengths"][idx])
-                                    sample_lengths[sample_idx][epoch].append(response_len)
-                                    sample_to_lengths[sample_idx].append(response_len)
-                                    for group_id, routed_indices in index_mapping.items():
-                                        if idx in routed_indices:
-                                            realized_group_loads[group_id] += response_len
-                                            break
-                                aggregated_lengths = router.update_history(sample_to_lengths)
-                                for group_id, load in enumerate(realized_group_loads):
-                                    metrics[f"routing/realized_response_load/group_{group_id}"] = float(load)
-                                    metrics[f"routing/realized_response_norm_load/group_{group_id}"] = float(
-                                        load / max(router.worker_weights[group_id], 1e-6)
-                                    )
-                                if predicted_loads:
-                                    predicted_norm = [load / max(w, 1e-6) for load, w in zip(predicted_loads, router.worker_weights, strict=True)]
-                                    metrics["routing/predicted_imbalance_ratio"] = (
-                                        (max(predicted_norm) - min(predicted_norm)) / max(predicted_norm)
-                                        if max(predicted_norm) > 0 else 0.0
-                                    )
-                                realized_norm = [load / max(w, 1e-6) for load, w in zip(realized_group_loads, router.worker_weights, strict=True)]
-                                metrics["routing/realized_imbalance_ratio"] = (
-                                    (max(realized_norm) - min(realized_norm)) / max(realized_norm)
-                                    if max(realized_norm) > 0 else 0.0
-                                )
-                                if aggregated_lengths:
-                                    metrics["routing/history_samples_updated"] = float(len(aggregated_lengths))
-                                print(f"sample_lengths: {sample_lengths}")
+                            elif "attention_mask" in gen_batch_output.batch and "response_mask" in gen_batch_output.batch:
+                                prompt_lengths_this_batch = (
+                                    gen_batch_output.batch["attention_mask"].sum(dim=-1)
+                                    - gen_batch_output.batch["response_mask"].sum(dim=-1)
+                                ).cpu().tolist()
                             else:
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                                prompt_lengths_this_batch = [0.0] * len(sample_idx_this_batch)
 
-                            timing_raw.update(gen_batch_output.meta_info["timing"])
-                            gen_batch_output.meta_info.pop("timing", None)
+                            index_mapping, routing_info = router.route(
+                                sample_indices=sample_idx_this_batch,
+                                prompt_lengths=prompt_lengths_this_batch,
+                                epoch=epoch,
+                            )
+                            print(f"sample_idx_this_batch: {sample_idx_this_batch}")
+                            print(f"prompt_lengths_this_batch: {prompt_lengths_this_batch}")
+                            print(f"index_mapping: {index_mapping}")
+                            gen_batch_output.meta_info['dp_index_mapping'] = index_mapping
+                            predicted_loads = routing_info.get("predicted_loads", [0.0] * num_rollout_groups)
+                            for group_id, load in enumerate(predicted_loads):
+                                metrics[f"routing/predicted_load/group_{group_id}"] = float(load)
+                                metrics[f"routing/predicted_norm_load/group_{group_id}"] = float(
+                                    load / max(router.worker_weights[group_id], 1e-6)
+                                )
+
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            
+                            print(f"after generate_sequences: {gen_batch_output=}")
+                            sample_to_lengths = defaultdict(list)
+                            realized_group_loads = [0.0] * num_rollout_groups
+                            for idx, sample_idx in enumerate(gen_batch_output.non_tensor_batch["index"]): # the global sample index across all datasets.
+                                response_len = float(gen_batch_output.non_tensor_batch["response_lengths"][idx])
+                                sample_lengths[sample_idx][epoch].append(response_len)
+                                sample_to_lengths[sample_idx].append(response_len)
+                                for group_id, routed_indices in index_mapping.items():
+                                    if idx in routed_indices:
+                                        realized_group_loads[group_id] += response_len
+                                        break
+                            aggregated_lengths = router.update_history(sample_to_lengths)
+                            for group_id, load in enumerate(realized_group_loads):
+                                metrics[f"routing/realized_response_load/group_{group_id}"] = float(load)
+                                metrics[f"routing/realized_response_norm_load/group_{group_id}"] = float(
+                                    load / max(router.worker_weights[group_id], 1e-6)
+                                )
+                            if predicted_loads:
+                                predicted_norm = [load / max(w, 1e-6) for load, w in zip(predicted_loads, router.worker_weights, strict=True)]
+                                metrics["routing/predicted_imbalance_ratio"] = (
+                                    (max(predicted_norm) - min(predicted_norm)) / max(predicted_norm)
+                                    if max(predicted_norm) > 0 else 0.0
+                                )
+                            realized_norm = [load / max(w, 1e-6) for load, w in zip(realized_group_loads, router.worker_weights, strict=True)]
+                            metrics["routing/realized_imbalance_ratio"] = (
+                                (max(realized_norm) - min(realized_norm)) / max(realized_norm)
+                                if max(realized_norm) > 0 else 0.0
+                            )
+                            if aggregated_lengths:
+                                metrics["routing/history_samples_updated"] = float(len(aggregated_lengths))
+                            print(f"sample_lengths: {sample_lengths}")
+                        else:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+
+                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                        gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1790,6 +1790,7 @@ class RayPPOTrainer:
                     if self._trainer_trace is not None:
                         self._trainer_trace.end_step()
 
+                    timing_raw["step"] = time.time() - _step_start
                     steps_duration = timing_raw["step"]
                     self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
