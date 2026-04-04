@@ -831,12 +831,20 @@ class ActorRolloutRefWorker(Worker):
         """
         Generator yielding (name, tensor) pairs of the full merged model.
         Each worker gathers all stages' weights via all_gather_object.
+
+        Each PP stage wraps the full HF model (with pruned layers), so non-layer
+        params (embed_tokens, norm, lm_head) appear in every stage's state_dict.
+        We deduplicate: yield each name only from the first stage that has it.
         """
         local_sd = self.train_stage.get_global_state_dict()
         gathered = [None] * self.pp_size
         dist.all_gather_object(gathered, local_sd)
+        seen = set()
         for stage_sd in gathered:
             for name, tensor in stage_sd.items():
+                if name in seen:
+                    continue
+                seen.add(name)
                 # all_gather_object deserializes tensors onto CPU;
                 # SGLang's weight sync expects CUDA tensors for IPC serialization
                 yield name, tensor.to(self.device) if tensor.device.type == "cpu" else tensor

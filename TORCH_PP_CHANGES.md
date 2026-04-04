@@ -68,3 +68,27 @@ num_micro_batches: int = 4
 
 - **"actor" mesh**: all workers `dp_rank=0`, only last PP stage `is_collect=True` → all workers get same data, only last returns results
 - **"rollout" mesh**: each worker `dp_rank=rank`, all `is_collect=True` → data split across GPUs for DP rollout
+
+## Bug Fixes
+
+### PP weight sync producing gibberish during SGLang rollout (2026-04-03)
+
+**Symptom:** All rollout outputs were random multilingual gibberish (entropy ~9.4 vs correct ~4.2). Model produced 0% reward on GSM8K. All responses hit max_length. Training was unaffected — only the SGLang rollout was broken.
+
+**Root cause:** In PP mode, each `PipelineStage` wraps the full `Qwen3ForCausalLM` with pruned layers. Non-layer parameters (`model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight`) exist in **every stage's state dict**, but only the owning stage's copy is kept current during training.
+
+`_collect_full_state_dict()` gathers all stages via `all_gather_object` and yields them sequentially (stage 0 → 3). For duplicate keys, the last stage's tensor is what SGLang's `load_weights()` sees last — overwriting correct weights (e.g., stage 0's embedding) with stale copies from stage 3. The model then runs with a corrupted embedding layer.
+
+**Fix** (`verl/workers/torch_pp_workers.py`, `_collect_full_state_dict`): Deduplicate by tracking seen parameter names. Only yield each name from the first stage that has it:
+
+```python
+seen = set()
+for stage_sd in gathered:
+    for name, tensor in stage_sd.items():
+        if name in seen:
+            continue
+        seen.add(name)
+        yield name, tensor.to(self.device) if tensor.device.type == "cpu" else tensor
+```
+
+**Impact:** All prior PP>1 + SGLang rollout experiments had invalid rollout data. Training weights were correct (uses `load_state_dict_from_full` which handles this properly).

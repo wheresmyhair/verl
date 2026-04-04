@@ -1527,18 +1527,34 @@ class RayPPOTrainer:
                                 )
 
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                            
-                            print(f"after generate_sequences: {gen_batch_output=}")
+
+                            # Restore original sample ordering after DP gather.
+                            # The dispatch splits samples by index_mapping and the collect
+                            # concatenates DP worker outputs in worker order, so the returned
+                            # order is [group0_indices, group1_indices, ...]. We need to
+                            # invert this to match batch.repeat() ordering for union.
+                            gather_order = []
+                            for group_id in sorted(index_mapping.keys()):
+                                gather_order.extend(index_mapping[group_id])
+                            if gather_order != list(range(len(gather_order))):
+                                inverse = [0] * len(gather_order)
+                                for new_pos, orig_pos in enumerate(gather_order):
+                                    inverse[orig_pos] = new_pos
+                                gen_batch_output = gen_batch_output.select_idxs(inverse)
                             sample_to_lengths = defaultdict(list)
                             realized_group_loads = [0.0] * num_rollout_groups
-                            for idx, sample_idx in enumerate(gen_batch_output.non_tensor_batch["index"]): # the global sample index across all datasets.
+                            # Build reverse map: original batch position -> group_id
+                            pos_to_group = {}
+                            for group_id, routed_indices in index_mapping.items():
+                                for pos in routed_indices:
+                                    pos_to_group[pos] = group_id
+                            for idx, sample_idx in enumerate(gen_batch_output.non_tensor_batch["index"]):
                                 response_len = float(gen_batch_output.non_tensor_batch["response_lengths"][idx])
                                 sample_lengths[sample_idx][epoch].append(response_len)
                                 sample_to_lengths[sample_idx].append(response_len)
-                                for group_id, routed_indices in index_mapping.items():
-                                    if idx in routed_indices:
-                                        realized_group_loads[group_id] += response_len
-                                        break
+                                # idx is now the original batch position (after reorder)
+                                group_id = pos_to_group.get(idx, 0)
+                                realized_group_loads[group_id] += response_len
                             aggregated_lengths = router.update_history(sample_to_lengths)
                             for group_id, load in enumerate(realized_group_loads):
                                 metrics[f"routing/realized_response_load/group_{group_id}"] = float(load)
