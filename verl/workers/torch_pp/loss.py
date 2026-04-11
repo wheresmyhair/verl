@@ -229,6 +229,7 @@ def compute_grpo_loss_fused(
     entropy_coef: float = 0.0,
     loss_agg: str = "token-mean",
     chunk_size: int = 512,
+    shifted_labels: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     GRPO loss using FusedLinearForPPO — never materializes [B, S, V] logits.
@@ -251,15 +252,20 @@ def compute_grpo_loss_fused(
 
     R = old_log_probs.size(1)
 
-    # FusedLinearForPPO expects rolled labels: position i predicts label[i]
-    # which should be input_ids[i+1] for causal LM
-    rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
+    # FusedLinearForPPO expects shifted labels: position i predicts label[i]
+    # which should be input_ids[i+1] for causal LM.
+    # When shifted_labels is provided (e.g., from rmpad-aware caller),
+    # use it directly to ensure consistency with compute_log_prob.
+    if shifted_labels is not None:
+        labels = shifted_labels
+    else:
+        labels = torch.roll(input_ids, shifts=-1, dims=-1)
 
     fused = FusedLinearForPPO(chunk_size=chunk_size)
     full_log_probs, full_entropy = fused.forward(
         hidden_states=hidden_states,
         vocab_weights=lm_head_weight,
-        input_ids=rolled_labels,
+        input_ids=labels,
         temperature=1.0,
     )
     # full_log_probs/full_entropy: [B, S] — drop last position (garbage from roll)

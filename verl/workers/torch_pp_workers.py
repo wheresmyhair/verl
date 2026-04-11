@@ -163,6 +163,52 @@ def _load_optimizer(optimizer, device):
 
 
 # ======================================================================
+# Simplified GRPO loss from pre-computed response log_probs
+# ======================================================================
+
+def _compute_grpo_loss_from_resp_lp(
+    new_resp_lp: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    ref_log_probs=None,
+    clip_ratio: float = 0.2,
+    kl_coef: float = 0.001,
+    entropy_coef: float = 0.0,
+):
+    """GRPO loss given pre-computed new response log_probs [micro_B, R]."""
+    log_ratio = new_resp_lp - old_log_probs
+    ratio = torch.exp(log_ratio)
+    clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+
+    adv = advantages.unsqueeze(1)
+    pg_loss = torch.max(-ratio * adv, -clipped * adv)
+
+    kl_loss = torch.zeros_like(pg_loss)
+    if ref_log_probs is not None and kl_coef > 0.0:
+        kl_loss = kl_coef * (new_resp_lp - ref_log_probs)
+
+    token_loss = (pg_loss + kl_loss) * response_mask
+    num_tokens = response_mask.sum().clamp(min=1)
+    loss = token_loss.sum() / num_tokens
+
+    with torch.no_grad():
+        valid = response_mask.bool()
+        stats = {
+            "loss": loss.item(),
+            "pg_loss": (pg_loss * response_mask).sum().item() / num_tokens.item(),
+            "ratio_mean": ratio[valid].mean().item() if valid.any() else 0.0,
+            "ratio_max": ratio[valid].max().item() if valid.any() else 0.0,
+            "clip_frac": ((ratio[valid] - 1.0).abs() > clip_ratio).float().mean().item()
+            if valid.any() else 0.0,
+        }
+        if ref_log_probs is not None:
+            kl_valid = (new_resp_lp - ref_log_probs)[valid]
+            stats["kl_per_token"] = kl_valid.mean().item() if valid.any() else 0.0
+    return loss, stats
+
+
+# ======================================================================
 # PP forward helper (shared between compute_log_prob / compute_ref_log_prob)
 # ======================================================================
 
@@ -240,9 +286,39 @@ def _pp_forward_log_prob(
 
             if stage.is_last:
                 micro_ids = stage._micro_input_ids[mb]  # [1, nnz] or [micro_B, S]
-                if tracer is not None:
-                    with tracer.trace(loss_trace_name, mb):
-                        if use_fused_loss:
+
+                def _compute_lp(output, micro_ids, mb):
+                    if use_fused_loss:
+                        if use_remove_padding and stage._micro_cu_seqlens:
+                            # Packed sequences: build shifted labels respecting
+                            # sequence boundaries (torch.roll would cross them).
+                            cu = stage._micro_cu_seqlens[mb]
+                            ids_flat = micro_ids.squeeze(0)  # [nnz]
+                            shifted = torch.empty_like(ids_flat)
+                            for j in range(len(cu) - 1):
+                                s, e = cu[j].item(), cu[j + 1].item()
+                                shifted[s:e - 1] = ids_flat[s + 1:e]
+                                shifted[e - 1] = 0  # last pos per seq → garbage label, will be dropped
+                            shifted_labels = shifted.unsqueeze(0)  # [1, nnz]
+                            lp, ent = fused.forward(
+                                hidden_states=output,
+                                vocab_weights=stage.lm_head_weight,
+                                input_ids=shifted_labels,
+                                temperature=1.0,
+                            )
+                            # lp/ent are [1, nnz]. Extract valid positions
+                            # (drop last of each seq) → [1, nnz - num_seqs]
+                            valid = []
+                            valid_ent = []
+                            for j in range(len(cu) - 1):
+                                s, e = cu[j].item(), cu[j + 1].item()
+                                valid.append(lp[0, s:e - 1])
+                                if calculate_entropy:
+                                    valid_ent.append(ent[0, s:e - 1])
+                            all_log_probs.append(torch.cat(valid).unsqueeze(0))  # [1, nnz-nseqs]
+                            if calculate_entropy:
+                                all_entropys.append(torch.cat(valid_ent).unsqueeze(0))
+                        else:
                             rolled_labels = torch.roll(micro_ids, shifts=-1, dims=-1)
                             lp, ent = fused.forward(
                                 hidden_states=output,
@@ -253,26 +329,16 @@ def _pp_forward_log_prob(
                             all_log_probs.append(lp[:, :-1])
                             if calculate_entropy:
                                 all_entropys.append(ent[:, :-1])
-                        else:
-                            all_log_probs.append(log_probs_from_logits(output, micro_ids))
-                            if calculate_entropy:
-                                all_entropys.append(entropy_from_logits(output))
-                else:
-                    if use_fused_loss:
-                        rolled_labels = torch.roll(micro_ids, shifts=-1, dims=-1)
-                        lp, ent = fused.forward(
-                            hidden_states=output,
-                            vocab_weights=stage.lm_head_weight,
-                            input_ids=rolled_labels,
-                            temperature=1.0,
-                        )
-                        all_log_probs.append(lp[:, :-1])
-                        if calculate_entropy:
-                            all_entropys.append(ent[:, :-1])
                     else:
                         all_log_probs.append(log_probs_from_logits(output, micro_ids))
                         if calculate_entropy:
                             all_entropys.append(entropy_from_logits(output))
+
+                if tracer is not None:
+                    with tracer.trace(loss_trace_name, mb):
+                        _compute_lp(output, micro_ids, mb)
+                else:
+                    _compute_lp(output, micro_ids, mb)
             else:
                 out_t = output.detach().contiguous().cpu()
                 pair_group = pp_pair_groups[pp_rank]
@@ -286,9 +352,9 @@ def _pp_forward_log_prob(
 
     if stage.is_last:
         if use_remove_padding:
-            # Concatenate unpadded log_probs from all micro-batches.
-            # Each is [1, nnz_i-1]. We need to pad back to [micro_B, S-1]
-            # per micro-batch, then cat to [B, S-1] for the caller.
+            # Each all_log_probs[i] is [1, nnz_i - num_seqs_i] (valid positions
+            # only, last position of each sequence already dropped).
+            # Re-pad to [micro_B, S-1] per micro-batch, then cat to [B, S-1].
             from flash_attn.bert_padding import pad_input, unpad_input
             padded_lps = []
             padded_ents = []
@@ -296,31 +362,30 @@ def _pp_forward_log_prob(
             for i, lp_rmpad in enumerate(all_log_probs):
                 mb_mask = micro_masks[i]
                 mb_B = mb_mask.size(0)
-                # Unpad the mask to get indices for padding back
                 _, indices, cu_seqlens, *_ = unpad_input(
                     mb_mask.unsqueeze(-1), mb_mask
                 )
-                # lp_rmpad is [1, nnz-1] — we need to pad to [mb_B, S-1]
-                # The log_probs correspond to positions 0..nnz-2 (shifted).
-                # For padding back, we truncate indices to match nnz-1 length.
-                lp_flat = lp_rmpad.squeeze(0)  # [nnz-1]
-                # Build indices for the shifted (S-1) dimension
+                lp_flat = lp_rmpad.squeeze(0)  # [nnz - num_seqs]
+                # Build shifted indices: for each seq of length L, map L-1
+                # log_prob values to positions 0..L-2 in the (S-1)-padded output.
                 seq_lens = cu_seqlens.diff().tolist()
                 shifted_indices = []
                 offset = 0
                 for sl in seq_lens:
-                    shifted_indices.append(indices[offset:offset+sl-1])
+                    shifted_indices.append(indices[offset:offset + sl - 1])
                     offset += sl
                 shifted_idx = torch.cat(shifted_indices) if shifted_indices else indices[:0]
-                lp_padded = torch.zeros(mb_B, S - 1, device=device, dtype=lp_flat.dtype)
+                # Indices are in [mb_B, S] flat space but pad_input targets
+                # [mb_B, S-1]. Adjust: new_flat = (old_flat // S) * (S-1) + (old_flat % S)
+                adjusted_idx = (shifted_idx // S) * (S - 1) + (shifted_idx % S)
                 lp_padded_flat = pad_input(
-                    lp_flat.unsqueeze(-1), shifted_idx, mb_B, S - 1
+                    lp_flat.unsqueeze(-1), adjusted_idx, mb_B, S - 1
                 ).squeeze(-1)
                 padded_lps.append(lp_padded_flat)
                 if calculate_entropy and i < len(all_entropys):
                     ent_flat = all_entropys[i].squeeze(0)
                     ent_padded = pad_input(
-                        ent_flat.unsqueeze(-1), shifted_idx, mb_B, S - 1
+                        ent_flat.unsqueeze(-1), adjusted_idx, mb_B, S - 1
                     ).squeeze(-1)
                     padded_ents.append(ent_padded)
             full_log_probs = torch.cat(padded_lps, dim=0)
@@ -830,24 +895,66 @@ class ActorRolloutRefWorker(Worker):
     def _collect_full_state_dict(self):
         """
         Generator yielding (name, tensor) pairs of the full merged model.
-        Each worker gathers all stages' weights via all_gather_object.
 
-        Each PP stage wraps the full HF model (with pruned layers), so non-layer
-        params (embed_tokens, norm, lm_head) appear in every stage's state_dict.
-        We deduplicate: yield each name only from the first stage that has it.
+        Uses per-tensor NCCL broadcast instead of all_gather_object to avoid
+        pickle serialization overhead (~30s → ~1-3s for 1.7B model).
+
+        Phase 1: all_gather_object on metadata only (list of param names/shapes).
+        Phase 2: For each param, owning stage broadcasts the tensor to all ranks.
         """
-        local_sd = self.train_stage.get_global_state_dict()
-        gathered = [None] * self.pp_size
-        dist.all_gather_object(gathered, local_sd)
-        seen = set()
-        for stage_sd in gathered:
-            for name, tensor in stage_sd.items():
-                if name in seen:
-                    continue
-                seen.add(name)
-                # all_gather_object deserializes tensors onto CPU;
-                # SGLang's weight sync expects CUDA tensors for IPC serialization
-                yield name, tensor.to(self.device) if tensor.device.type == "cpu" else tensor
+        # Phase 1: collect metadata — which rank owns which params.
+        # Use get_global_state_dict for name mapping (local→global layer indices),
+        # but keep tensors on GPU for NCCL broadcast (no .cpu() copy).
+        from verl.workers.torch_pp.pipeline_stage import restore_global_layer_keys
+
+        # Build local state dict with GPU tensors + global key names
+        raw_sd = self.train_stage.state_dict()
+        prefix = "model."
+        local_sd_cpu_keys = {
+            (k[len(prefix):] if k.startswith(prefix) else k): v
+            for k, v in raw_sd.items()
+        }
+        local_sd = restore_global_layer_keys(local_sd_cpu_keys, self.train_stage.start_layer)
+
+        # Determine which params this rank owns:
+        #   embed_tokens → first stage only (non-first stages have stale copies)
+        #   norm, lm_head → last stage only (non-last stages have Identity, no params)
+        #   layer params → the stage whose [start, end) covers them
+        my_meta = []
+        my_tensors = {}
+        for name, tensor in local_sd.items():
+            if "embed_tokens" in name and not self.train_stage.is_first:
+                continue
+            my_meta.append((name, tuple(tensor.shape), str(tensor.dtype)))
+            my_tensors[name] = tensor
+
+        all_meta = [None] * self.pp_size
+        dist.all_gather_object(all_meta, my_meta)
+
+        # Phase 2: per-tensor NCCL broadcast.
+        # Build ordered list: (owning_rank, name, shape, dtype)
+        param_list = []
+        for rank, rank_meta in enumerate(all_meta):
+            for (name, shape, dtype_str) in rank_meta:
+                param_list.append((rank, name, shape, dtype_str))
+
+        dtype_map = {
+            "torch.bfloat16": torch.bfloat16,
+            "torch.float16": torch.float16,
+            "torch.float32": torch.float32,
+        }
+
+        for owning_rank, name, shape, dtype_str in param_list:
+            dt = dtype_map.get(dtype_str, torch.bfloat16)
+            if owning_rank == self.pp_rank:
+                # Ensure contiguous CPU tensor for broadcast
+                tensor_cpu = my_tensors[name].detach().cpu().contiguous()
+            else:
+                tensor_cpu = torch.empty(shape, dtype=dt, device="cpu")
+            # Broadcast on CPU (gloo-compatible, no CUDA IPC issues)
+            dist.broadcast(tensor_cpu, src=owning_rank)
+            # Move to GPU — creates a fresh CUDA allocation (IPC-compatible)
+            yield name, tensor_cpu.to(self.device)
 
     # ==================================================================
     # generate_sequences — matches megatron generate_sequences exactly
@@ -1190,6 +1297,7 @@ class ActorRolloutRefWorker(Worker):
             self.optimizer.zero_grad()
 
             # Pre-chunk loss inputs for last stage
+            micro_shifted_labels = None
             if self.train_stage.is_last:
                 micro_input_ids = list(input_ids.chunk(M, dim=0))
                 micro_resp_starts = list(response_start_positions.chunk(M, dim=0))
@@ -1197,6 +1305,30 @@ class ActorRolloutRefWorker(Worker):
                 micro_adv = list(advantages.chunk(M, dim=0))
                 micro_resp_mask = list(response_mask.chunk(M, dim=0))
                 micro_ref_lp = list(ref_log_probs_full.chunk(M, dim=0)) if ref_log_probs_full is not None else None
+
+                # When rmpad is active, build shifted labels that match
+                # compute_log_prob's convention: within each sequence,
+                # label[i] = input_ids[i+1]; last non-pad position gets 0.
+                # This avoids the torch.roll mismatch where compute_log_prob
+                # uses label=0 but torch.roll uses label=pad/EOS at that position.
+                if self._use_remove_padding:
+                    micro_masks = list(attention_mask.chunk(M, dim=0))
+                    micro_shifted_labels = []
+                    for i in range(M):
+                        ids_mb = micro_input_ids[i]        # [micro_B, S]
+                        mask_mb = micro_masks[i]            # [micro_B, S]
+                        shifted = torch.roll(ids_mb, shifts=-1, dims=-1)
+                        # Fix last non-pad position per sequence: set label to 0
+                        seq_lengths = mask_mb.sum(dim=-1)   # [micro_B]
+                        # Find the column of the last non-pad token
+                        # For right-padded: last_col = first_nonzero + seq_len - 1
+                        # General: last non-pad = last index where mask=1
+                        for b in range(ids_mb.size(0)):
+                            sl = seq_lengths[b].item()
+                            if sl > 0:
+                                last_col = mask_mb[b].nonzero()[-1].item()
+                                shifted[b, last_col] = 0
+                        micro_shifted_labels.append(shifted)
 
             schedule = build_1f1b_schedule(self.pp_rank, self.pp_size, M)
 
@@ -1247,19 +1379,90 @@ class ActorRolloutRefWorker(Worker):
 
                     if self.train_stage.is_last:
                         with tracer.trace("loss", mb):
-                            loss, stats = compute_grpo_loss_fused(
-                                hidden_states=output,
-                                lm_head_weight=self.train_stage.lm_head_weight,
-                                input_ids=micro_input_ids[mb],
-                                response_start_positions=micro_resp_starts[mb],
-                                old_log_probs=micro_old_lp[mb],
-                                advantages=micro_adv[mb],
-                                response_mask=micro_resp_mask[mb],
-                                ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
-                                clip_ratio=self.config.actor.clip_ratio,
-                                kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
-                                entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
-                            )
+                            if (self._use_remove_padding
+                                    and self.train_stage._micro_cu_seqlens):
+                                # === Packed-format loss path ===
+                                # Compute log_probs on packed hidden (same as compute_log_prob)
+                                # then re-pad log_probs (NOT hidden_states) to ensure
+                                # padding positions get 0 — matching compute_log_prob exactly.
+                                from flash_attn.bert_padding import pad_input
+                                from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+                                cu = self.train_stage._micro_cu_seqlens[mb]
+                                micro_ids_packed = self.train_stage._micro_input_ids[mb]  # [1, nnz]
+                                ids_flat = micro_ids_packed.squeeze(0)  # [nnz]
+
+                                # Build shifted labels (same convention as compute_log_prob)
+                                shifted = torch.empty_like(ids_flat)
+                                for j in range(len(cu) - 1):
+                                    s, e = cu[j].item(), cu[j + 1].item()
+                                    shifted[s:e - 1] = ids_flat[s + 1:e]
+                                    shifted[e - 1] = 0
+
+                                fused_loss = FusedLinearForPPO(chunk_size=512)
+                                lp, ent = fused_loss.forward(
+                                    hidden_states=output,  # [1, nnz, H]
+                                    vocab_weights=self.train_stage.lm_head_weight,
+                                    input_ids=shifted.unsqueeze(0),
+                                    temperature=1.0,
+                                )  # lp, ent: [1, nnz]
+
+                                # Extract valid positions (drop last per seq)
+                                valid_lp_parts = []
+                                for j in range(len(cu) - 1):
+                                    s, e = cu[j].item(), cu[j + 1].item()
+                                    valid_lp_parts.append(lp[0, s:e - 1])
+                                valid_lp = torch.cat(valid_lp_parts)  # [nnz - nseqs]
+
+                                # Re-pad to [micro_B, S-1] — same as compute_log_prob
+                                _mb_B, _mb_S = self.train_stage._micro_batch_shape
+                                unpad_indices = self.train_stage._micro_unpad_indices[mb]
+                                seq_lens_list = cu.diff().tolist()
+                                shifted_indices = []
+                                offset = 0
+                                for sl in seq_lens_list:
+                                    shifted_indices.append(unpad_indices[offset:offset + sl - 1])
+                                    offset += sl
+                                shifted_idx = torch.cat(shifted_indices) if shifted_indices else unpad_indices[:0]
+                                adjusted_idx = (shifted_idx // _mb_S) * (_mb_S - 1) + (shifted_idx % _mb_S)
+
+                                new_full_lp = pad_input(
+                                    valid_lp.unsqueeze(-1), adjusted_idx, _mb_B, _mb_S - 1
+                                ).squeeze(-1)  # [micro_B, S-1]
+
+                                # Extract response portion — same as _extract_response_log_probs
+                                R = micro_old_lp[mb].size(1)
+                                new_resp_lp = gather_response_log_probs(
+                                    new_full_lp, micro_resp_starts[mb], R
+                                )
+                                new_resp_lp = new_resp_lp * micro_resp_mask[mb]
+
+                                # GRPO loss from pre-computed response log_probs
+                                loss, stats = _compute_grpo_loss_from_resp_lp(
+                                    new_resp_lp=new_resp_lp,
+                                    old_log_probs=micro_old_lp[mb],
+                                    advantages=micro_adv[mb],
+                                    response_mask=micro_resp_mask[mb],
+                                    ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
+                                    clip_ratio=self.config.actor.clip_ratio,
+                                    kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
+                                    entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
+                                )
+                            else:
+                                # === Standard padded loss path ===
+                                loss, stats = compute_grpo_loss_fused(
+                                    hidden_states=output,
+                                    lm_head_weight=self.train_stage.lm_head_weight,
+                                    input_ids=micro_input_ids[mb],
+                                    response_start_positions=micro_resp_starts[mb],
+                                    old_log_probs=micro_old_lp[mb],
+                                    advantages=micro_adv[mb],
+                                    response_mask=micro_resp_mask[mb],
+                                    ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
+                                    clip_ratio=self.config.actor.clip_ratio,
+                                    kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
+                                    entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
+                                )
                             scaled_loss = loss / M
                             scaled_loss.backward()
                         all_stats.append(stats)

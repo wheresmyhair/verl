@@ -280,12 +280,16 @@ class PipelineStage(nn.Module):
 
         self._use_remove_padding = use_remove_padding
         self._micro_nnz: List[int] = []  # total_nnz per micro-batch (for comm shapes)
+        self._micro_unpad_indices: List[Optional[torch.Tensor]] = []  # for re-padding hidden states
+        self._micro_cu_seqlens: List[Optional[torch.Tensor]] = []  # cumulative seq lengths per micro-batch
+        self._micro_batch_shape: Optional[tuple] = None  # (micro_B, S) for re-padding
 
         if use_remove_padding and _FLASH_PADDING_AVAILABLE:
             # Unpad each micro-batch: [micro_B, S] -> [1, total_nnz]
             self._micro_input_ids = []
             self._micro_attention_mask = []  # None for each micro-batch
             self._micro_position_ids = []
+            self._micro_batch_shape = (micro_ids[0].size(0), micro_ids[0].size(1))
             for i in range(num_micro_batches):
                 ids_rmpad, indices, cu_seqlens, max_seqlen, *_ = unpad_input(
                     micro_ids[i].unsqueeze(-1), micro_mask[i]
@@ -293,6 +297,8 @@ class PipelineStage(nn.Module):
                 ids_rmpad = ids_rmpad.squeeze(-1)  # [total_nnz]
                 total_nnz = ids_rmpad.size(0)
                 self._micro_nnz.append(total_nnz)
+                self._micro_unpad_indices.append(indices)
+                self._micro_cu_seqlens.append(cu_seqlens)
 
                 # Build position_ids with resets: [0,1,..,L1-1, 0,1,..,L2-1, ...]
                 seq_lens = cu_seqlens.diff().tolist()

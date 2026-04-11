@@ -207,7 +207,10 @@ def _post_process_outputs(processing_class, output):
             raise ValueError(f"Cannot get tokenizer from processing_class {processing_class}") from e
 
     def _map_each_response(resp):
-        output_token_logprobs = resp["meta_info"]["output_token_logprobs"]
+        output_token_logprobs = resp.get("meta_info", {}).get("output_token_logprobs", [])
+        if not output_token_logprobs:
+            # Aborted or empty response — return empty tensors
+            return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.float32)
         log_probs, output_token_ids = zip(
             *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
         )
@@ -724,17 +727,40 @@ class SGLangRollout(BaseRollout):
         # Update with any additional kwargs
         request_sampling_params.update(kwargs)
 
+        progressive_threshold = self.config.get("progressive_threshold", None)
+        # Only use progressive for main rollout (not validation), and when batch is large enough
+        use_progressive = (
+            progressive_threshold is not None
+            and progressive_threshold < 1.0
+            and not is_validate
+            and batch_size > 10
+        )
+
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
-            output = loop.run_until_complete(
-                self._engine.async_generate(
-                    prompt=None,  # because we have already convert it to prompt token id
-                    sampling_params=request_sampling_params,
-                    return_logprob=True,
-                    input_ids=idx_list,
-                    image_data=image_list,
+            if use_progressive:
+                # Progressive generation: per-request + early return
+                per_req_results, aborted, prog_elapsed = loop.run_until_complete(
+                    self._progressive_generate(
+                        idx_list, image_list, request_sampling_params,
+                        return_logprob=True,
+                        threshold=progressive_threshold,
+                    )
                 )
-            )
+                output = self._reassemble_batch_output(per_req_results, batch_size)
+                if aborted:
+                    logger.info(f"Progressive rollout: {len(aborted)} of {batch_size} requests aborted "
+                                f"(threshold={progressive_threshold}, elapsed={prog_elapsed:.1f}s)")
+            else:
+                output = loop.run_until_complete(
+                    self._engine.async_generate(
+                        prompt=None,
+                        sampling_params=request_sampling_params,
+                        return_logprob=True,
+                        input_ids=idx_list,
+                        image_data=image_list,
+                    )
+                )
         else:
             output = None
 
@@ -805,6 +831,126 @@ class SGLangRollout(BaseRollout):
             loop.run_until_complete(self._engine.flush_cache())
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Progressive generation: per-request submission + early return
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _progressive_generate(
+        self,
+        idx_list: list,
+        image_list: list,
+        sampling_params: dict,
+        return_logprob: bool = True,
+        threshold: float = 0.9,
+    ):
+        """Submit individual requests, return when threshold fraction complete.
+
+        Returns:
+            results: dict[int, dict] — per-request outputs (keyed by index)
+            aborted: list[int] — indices of aborted requests
+            elapsed: float — total wall time
+        """
+        import time as _time
+        n = len(idx_list)
+        target = max(1, int(n * threshold))
+        t0 = _time.time()
+
+        # Submit each request individually with unique rid
+        async def _gen_one(i):
+            img = [image_list[i]] if image_list and image_list[i] is not None else None
+            out = await self._engine.async_generate(
+                prompt=None,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                input_ids=[idx_list[i]],
+                image_data=img,
+                rid=f"prog_{id(self)}_{i}",
+            )
+            return i, out
+
+        # Create tasks
+        tasks = [asyncio.create_task(_gen_one(i)) for i in range(n)]
+        results = {}
+        pending = set(range(n))
+
+        # Collect as they complete
+        for coro in asyncio.as_completed(tasks):
+            idx, out = await coro
+            results[idx] = out
+            pending.discard(idx)
+            if len(results) >= target:
+                break
+
+        # Abort remaining and wait for ALL to finish (SGLang requires no
+        # in-flight requests before release_memory_occupation)
+        aborted = sorted(pending)
+        if aborted:
+            for i in aborted:
+                self._engine.tokenizer_manager.abort_request(
+                    rid=f"prog_{id(self)}_{i}"
+                )
+            # Must wait for ALL tasks to fully complete/abort before returning,
+            # otherwise SGLang's release_memory_occupation will assert.
+            remaining_tasks = [tasks[i] for i in aborted if not tasks[i].done()]
+            if remaining_tasks:
+                done, still_pending = await asyncio.wait(remaining_tasks, timeout=30.0)
+                for t in done:
+                    try:
+                        idx, out = t.result()
+                        results[idx] = out
+                    except Exception:
+                        pass
+                # Force-cancel anything truly stuck
+                for t in still_pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        elapsed = _time.time() - t0
+        return results, aborted, elapsed
+
+    def _reassemble_batch_output(self, per_request_results: dict, batch_size: int):
+        """Reassemble per-request outputs into list-of-dicts format.
+
+        _post_process_outputs expects output to be a LIST of per-response dicts:
+          [{"text": "...", "meta_info": {...}}, {"text": "...", "meta_info": {...}}, ...]
+
+        SGLang async_generate with input_ids=[single_prompt] returns either:
+          - A list of 1 dict: [{"text": "...", "meta_info": {...}}]
+          - Or a single dict: {"text": "...", "meta_info": {...}}
+        """
+        batch_output = []
+        for i in range(batch_size):
+            out = per_request_results.get(i)
+            if out is None:
+                # Request was aborted with no response
+                batch_output.append({
+                    "text": "",
+                    "meta_info": {
+                        "output_token_logprobs": [],
+                        "completion_tokens": 0,
+                        "finish_reason": {"type": "abort"},
+                    },
+                })
+                continue
+
+            # Normalize: extract single response from batch-of-1
+            if isinstance(out, list):
+                out = out[0] if out else {}
+            elif isinstance(out, dict):
+                # Check if it's batch-of-1 format (values are lists of len 1)
+                # e.g. {"text": ["hello"], "meta_info": [{...}]}
+                first_val = next(iter(out.values()), None)
+                if isinstance(first_val, list) and len(first_val) == 1:
+                    out = {k: v[0] if isinstance(v, list) and len(v) == 1 else v
+                           for k, v in out.items()}
+
+            batch_output.append(out)
+
+        return batch_output
 
     async def _async_rollout_a_request(
         self,

@@ -186,6 +186,10 @@ class RolloutConfig(BaseConfig):
     routing_group_weights: Optional[list] = None
     routing_random_seed: int = 0
 
+    # Progressive rollout: abort remaining requests when this fraction complete.
+    # None or 1.0 = disabled (default, wait for all). 0.9 = return when 90% done.
+    progressive_threshold: Optional[float] = None
+
     sglang_engine_mode: str = "local"
 
     limit_images: Optional[int] = None
