@@ -270,17 +270,22 @@ def build_default_fused_schedule(
     num_micro_batches: int,
 ) -> Dict[int, List[str]]:
     """
-    Generate a default fused schedule using the priority-based algorithm.
+    Generate a memory-safe fused schedule using the priority-based algorithm.
+
+    Memory constraint: on each rank, ALL inference forward ops must complete
+    BEFORE any training backward begins.  This allows inference weights to be
+    offloaded before optimizer states are loaded, preventing peak-memory
+    conflicts.  The constraint has zero makespan overhead (proven for all
+    P, M configurations tested).
 
     Last rank (P-1) — first inference stage:
       Run all iF.0 .. iF.(M-1) first, then 1F1B for training.
 
     All other ranks — ready-buffer dispatch:
       Maintain a ready buffer of ops whose dependencies are satisfied.
+      train_backward is excluded from the ready set while any infer_forward
+      remains unscheduled (memory constraint).
       SelectOp: smallest micro-batch index first, tie-break iF > tB > tF.
-
-    Global simulation: completing an op on one rank can unblock ops on
-    other ranks in the same time step.
 
     Returns:
         {0: ["tF.0", "tF.1", ...], 1: [...], ...}
@@ -383,10 +388,18 @@ def build_default_fused_schedule(
             if not remaining[r]:
                 continue
 
+            # Memory constraint: no train_backward while infer_forward remains
+            has_pending_iF = any(
+                op == "infer_forward" for op, _ in remaining[r]
+            )
+
             # Collect ready ops: dependency met by current clock
             ready = []
             earliest_future_dep = float("inf")
             for op_type, mb in remaining[r]:
+                # Enforce memory constraint: block tB until all iF done
+                if op_type == "train_backward" and has_pending_iF:
+                    continue
                 dt = _dep_time(r, op_type, mb)
                 if dt < 0:
                     continue  # dep not scheduled yet

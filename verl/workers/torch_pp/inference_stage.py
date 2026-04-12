@@ -182,26 +182,78 @@ class InferenceStage:
         """
         Compute old_log_probs from hidden states using FusedLinearForPPO.
         Never materializes [B, S, V] logits.
+
+        Handles both padded [micro_B, S] and packed [1, nnz] formats.
         """
         from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
         assert self.is_last_infer, "compute_log_probs_fused only on last inference stage"
 
         input_ids = self._micro_input_ids[micro_batch_id]
-        rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
-
         fused = FusedLinearForPPO(chunk_size=512)
-        full_log_probs, _ = fused.forward(
-            hidden_states=hidden_states,
-            vocab_weights=self.stage.lm_head_weight,
-            input_ids=rolled_labels,
-            temperature=1.0,
-        )
-        full_log_probs = full_log_probs[:, :-1]  # [B, S-1]
 
-        resp_log_probs = gather_response_log_probs(
-            full_log_probs, response_start_positions, max_resp_len
-        )
+        if (self.stage._micro_cu_seqlens
+                and self.stage._micro_cu_seqlens[micro_batch_id] is not None):
+            # === Packed format: cu_seqlens-based shifted labels ===
+            from flash_attn.bert_padding import pad_input
+
+            cu = self.stage._micro_cu_seqlens[micro_batch_id]
+            ids_flat = input_ids.squeeze(0)  # [nnz]
+            shifted = torch.empty_like(ids_flat)
+            for j in range(len(cu) - 1):
+                s, e = cu[j].item(), cu[j + 1].item()
+                shifted[s:e - 1] = ids_flat[s + 1:e]
+                shifted[e - 1] = 0
+
+            lp, _ = fused.forward(
+                hidden_states=hidden_states,
+                vocab_weights=self.stage.lm_head_weight,
+                input_ids=shifted.unsqueeze(0),
+                temperature=1.0,
+            )  # [1, nnz]
+
+            # Extract valid positions (drop last per seq)
+            valid_parts = []
+            for j in range(len(cu) - 1):
+                s, e = cu[j].item(), cu[j + 1].item()
+                valid_parts.append(lp[0, s:e - 1])
+            valid_lp = torch.cat(valid_parts)  # [nnz - nseqs]
+
+            # Re-pad to [micro_B, S-1]
+            _mb_B, _mb_S = self.stage._micro_batch_shape
+            unpad_indices = self.stage._micro_unpad_indices[micro_batch_id]
+            seq_lens_list = cu.diff().tolist()
+            shifted_indices = []
+            offset = 0
+            for sl in seq_lens_list:
+                shifted_indices.append(unpad_indices[offset:offset + sl - 1])
+                offset += sl
+            shifted_idx = (torch.cat(shifted_indices) if shifted_indices
+                           else unpad_indices[:0])
+            adjusted_idx = ((shifted_idx // _mb_S) * (_mb_S - 1)
+                            + (shifted_idx % _mb_S))
+
+            padded_lp = pad_input(
+                valid_lp.unsqueeze(-1), adjusted_idx, _mb_B, _mb_S - 1
+            ).squeeze(-1)  # [micro_B, S-1]
+
+            resp_log_probs = gather_response_log_probs(
+                padded_lp, response_start_positions, max_resp_len
+            )
+        else:
+            # === Standard padded format ===
+            rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
+            full_log_probs, _ = fused.forward(
+                hidden_states=hidden_states,
+                vocab_weights=self.stage.lm_head_weight,
+                input_ids=rolled_labels,
+                temperature=1.0,
+            )
+            full_log_probs = full_log_probs[:, :-1]  # [B, S-1]
+
+            resp_log_probs = gather_response_log_probs(
+                full_log_probs, response_start_positions, max_resp_len
+            )
         return resp_log_probs
 
     def get_state_dict(self) -> Dict[str, torch.Tensor]:

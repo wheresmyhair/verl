@@ -693,6 +693,15 @@ class ActorRolloutRefWorker(Worker):
             if rank == i or rank == i + 1:
                 pair_groups[i] = pair_group
 
+        # Separate inference pair groups — in fused forward, training backward
+        # and inference forward both send rank i+1 → i on the same pair group.
+        # Gloo matches sends/recvs in FIFO order per direction, so interleaving
+        # them causes size mismatches. Separate groups avoid this.
+        for i in range(world_size - 1):
+            infer_group = dist.new_group(ranks=[i, i + 1], backend="gloo")
+            if rank == i or rank == i + 1:
+                pair_groups[f"infer_{i}"] = infer_group
+
         # Fused forward needs rank 0 ↔ rank P-1 for old_log_probs transfer.
         # For P>=3 these ranks aren't adjacent, so create a dedicated group.
         # Always create it (new_group is a collective — all ranks must call it).
@@ -705,7 +714,7 @@ class ActorRolloutRefWorker(Worker):
         self._pp_pair_groups = pair_groups
 
         if rank == 0:
-            print(f"[PP] Created {world_size - 1} gloo pair groups for PP communication", flush=True)
+            print(f"[PP] Created {world_size - 1} training + {world_size - 1} inference gloo pair groups", flush=True)
 
     # ==================================================================
     # init_model
@@ -1630,33 +1639,43 @@ class ActorRolloutRefWorker(Worker):
             pending_sends: List = []
             _send_bufs: List = []  # prevent GC before isend completes
 
-            def _get_pair_group(rank_a, rank_b):
+            def _get_pair_group(rank_a, rank_b, is_infer=False):
                 """Look up the gloo pair group for two ranks."""
                 if abs(rank_a - rank_b) == 1:
-                    return self._pp_pair_groups[min(rank_a, rank_b)]
+                    key = f"infer_{min(rank_a, rank_b)}" if is_infer else min(rank_a, rank_b)
+                    return self._pp_pair_groups[key]
                 # Non-adjacent: old_log_probs group (rank 0 ↔ P-1)
                 return self._pp_pair_groups["olp"]
 
-            def _p2p_send(tensor, dst_rank):
+            def _p2p_send(tensor, dst_rank, is_infer=False):
                 """Non-blocking send via gloo pair group (CPU-staged)."""
                 t = tensor.detach().contiguous().cpu()
                 _send_bufs.append(t)
-                group = _get_pair_group(self.pp_rank, dst_rank)
+                group = _get_pair_group(self.pp_rank, dst_rank, is_infer=is_infer)
                 return dist.isend(t, dst=dst_rank, group=group)
 
-            def _p2p_recv(shape, src_rank, dtype):
+            def _p2p_recv(shape, src_rank, dtype, is_infer=False):
                 """Recv via gloo pair group (CPU-staged)."""
                 buf = torch.empty(shape, dtype=dtype, device="cpu")
-                group = _get_pair_group(self.pp_rank, src_rank)
+                group = _get_pair_group(self.pp_rank, src_rank, is_infer=is_infer)
                 dist.recv(buf, src=src_rank, group=group)
                 return buf.to(self.device)
             old_log_probs_stash: Dict[int, torch.Tensor] = {}
             all_old_log_probs = [None] * M
+            _infer_offloaded = False  # Track phase transition
 
             P = self.pp_size
 
             for op in schedule_ops:
                 mb = op.micro_batch_id
+
+                # Phase transition: offload inference weights before first tB
+                # The constrained schedule guarantees all iF are done by now.
+                if op.op == "train_backward" and not _infer_offloaded:
+                    if self.infer_stage is not None and self._is_offload_param:
+                        with tracer.trace("offload_infer"):
+                            self.infer_stage.to("cpu")
+                    _infer_offloaded = True
 
                 if op.op == "train_forward":
                     input_hidden = None
@@ -1684,19 +1703,83 @@ class ActorRolloutRefWorker(Worker):
                         all_old_log_probs[mb] = old_lp.detach()
 
                         with tracer.trace("loss", mb):
-                            loss, stats = compute_grpo_loss_fused(
-                                hidden_states=output,
-                                lm_head_weight=self.train_stage.lm_head_weight,
-                                input_ids=micro_input_ids[mb],
-                                response_start_positions=micro_resp_starts[mb],
-                                old_log_probs=old_lp,
-                                advantages=micro_adv[mb],
-                                response_mask=micro_resp_mask[mb],
-                                ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
-                                clip_ratio=self.config.actor.clip_ratio,
-                                kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
-                                entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
-                            )
+                            if (self._use_remove_padding
+                                    and self.train_stage._micro_cu_seqlens):
+                                # === Packed-format loss path ===
+                                from flash_attn.bert_padding import pad_input
+                                from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+                                cu = self.train_stage._micro_cu_seqlens[mb]
+                                micro_ids_packed = self.train_stage._micro_input_ids[mb]
+                                ids_flat = micro_ids_packed.squeeze(0)  # [nnz]
+
+                                shifted = torch.empty_like(ids_flat)
+                                for j in range(len(cu) - 1):
+                                    s, e = cu[j].item(), cu[j + 1].item()
+                                    shifted[s:e - 1] = ids_flat[s + 1:e]
+                                    shifted[e - 1] = 0
+
+                                fused_loss = FusedLinearForPPO(chunk_size=512)
+                                lp, _ent = fused_loss.forward(
+                                    hidden_states=output,
+                                    vocab_weights=self.train_stage.lm_head_weight,
+                                    input_ids=shifted.unsqueeze(0),
+                                    temperature=1.0,
+                                )  # [1, nnz]
+
+                                valid_lp_parts = []
+                                for j in range(len(cu) - 1):
+                                    s, e = cu[j].item(), cu[j + 1].item()
+                                    valid_lp_parts.append(lp[0, s:e - 1])
+                                valid_lp = torch.cat(valid_lp_parts)
+
+                                _mb_B, _mb_S = self.train_stage._micro_batch_shape
+                                unpad_indices = self.train_stage._micro_unpad_indices[mb]
+                                seq_lens_list = cu.diff().tolist()
+                                shifted_indices = []
+                                offset = 0
+                                for sl in seq_lens_list:
+                                    shifted_indices.append(unpad_indices[offset:offset + sl - 1])
+                                    offset += sl
+                                shifted_idx = (torch.cat(shifted_indices) if shifted_indices
+                                               else unpad_indices[:0])
+                                adjusted_idx = ((shifted_idx // _mb_S) * (_mb_S - 1)
+                                                + (shifted_idx % _mb_S))
+
+                                new_full_lp = pad_input(
+                                    valid_lp.unsqueeze(-1), adjusted_idx, _mb_B, _mb_S - 1
+                                ).squeeze(-1)  # [micro_B, S-1]
+
+                                new_resp_lp = gather_response_log_probs(
+                                    new_full_lp, micro_resp_starts[mb], R
+                                )
+                                new_resp_lp = new_resp_lp * micro_resp_mask[mb]
+
+                                loss, stats = _compute_grpo_loss_from_resp_lp(
+                                    new_resp_lp=new_resp_lp,
+                                    old_log_probs=old_lp,
+                                    advantages=micro_adv[mb],
+                                    response_mask=micro_resp_mask[mb],
+                                    ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
+                                    clip_ratio=self.config.actor.clip_ratio,
+                                    kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
+                                    entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
+                                )
+                            else:
+                                # === Standard padded loss path ===
+                                loss, stats = compute_grpo_loss_fused(
+                                    hidden_states=output,
+                                    lm_head_weight=self.train_stage.lm_head_weight,
+                                    input_ids=micro_input_ids[mb],
+                                    response_start_positions=micro_resp_starts[mb],
+                                    old_log_probs=old_lp,
+                                    advantages=micro_adv[mb],
+                                    response_mask=micro_resp_mask[mb],
+                                    ref_log_probs=micro_ref_lp[mb] if micro_ref_lp else None,
+                                    clip_ratio=self.config.actor.clip_ratio,
+                                    kl_coef=self.config.actor.get("kl_loss_coef", 0.001),
+                                    entropy_coef=self.config.actor.get("entropy_coeff", 0.0),
+                                )
                             scaled_loss = loss / M
                             scaled_loss.backward()
                         all_stats.append(stats)
@@ -1732,7 +1815,7 @@ class ActorRolloutRefWorker(Worker):
                         nnz = self.infer_stage._micro_nnz[mb]
                         act_shape = (1, nnz, self.hidden_size) if self._use_remove_padding else (micro_B, S, self.hidden_size)
                         with tracer.trace("p2p_recv", mb):
-                            input_hidden = _p2p_recv(act_shape, self.pp_rank + 1, self.infer_stage.dtype)
+                            input_hidden = _p2p_recv(act_shape, self.pp_rank + 1, self.infer_stage.dtype, is_infer=True)
 
                     with tracer.trace("infer_forward", mb):
                         output = self.infer_stage.forward_step(
@@ -1756,7 +1839,7 @@ class ActorRolloutRefWorker(Worker):
                             pending_sends.append(handle)
                     else:
                         with tracer.trace("p2p_send", mb):
-                            handle = _p2p_send(output, self.pp_rank - 1)
+                            handle = _p2p_send(output, self.pp_rank - 1, is_infer=True)
                         pending_sends.append(handle)
 
             for handle in pending_sends:
@@ -1802,7 +1885,7 @@ class ActorRolloutRefWorker(Worker):
             if self._is_offload_optimizer:
                 _offload_optimizer(self.optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during fused_update_actor", logger=logger)
-            if self.infer_stage is not None and self._is_offload_param:
+            if self.infer_stage is not None and self._is_offload_param and not _infer_offloaded:
                 _offload_module(self.infer_stage)
                 log_gpu_memory_usage("After offload infer stage during fused_update_actor", logger=logger)
         tracer.record_hbm("after_unload_fused")
