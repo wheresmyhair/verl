@@ -26,11 +26,14 @@
 set -x
 rm -f log_rank_*.txt
 
-export VERL_SGLANG_DYNAMIC_TP=1
+: "${VERL_SGLANG_DYNAMIC_TP:=1}"
+: "${VERL_RLPIPE_FANIN:=1}"
+: "${VERL_RLPIPE_FANIN_MIN_IDLE:=2}"
+export VERL_SGLANG_DYNAMIC_TP VERL_RLPIPE_FANIN VERL_RLPIPE_FANIN_MIN_IDLE
 export GLOO_SOCKET_TIMEOUT=7200
 export TORCH_NCCL_DEFAULT_TIMEOUT_SECONDS=7200
 
-PROFILING_DIR=/home/user/profiling_p3_m6b_14b_dp
+PROFILING_DIR=/home/user/profiling_p3_m6b2_14b_fanin
 if [ -d "$PROFILING_DIR" ]; then
     BACKUP_DIR="${PROFILING_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
     mv "$PROFILING_DIR" "$BACKUP_DIR"
@@ -43,7 +46,7 @@ INFERENCE_BATCH_SIZE=8
 GPU_MEMORY_UTILIZATION=0.55
 
 YOUR_PROJECT_NAME=verl-rollout-optim
-YOUR_RUN_NAME=p3-m6b-14b-dapo
+YOUR_RUN_NAME=p3-m6b2-14b-fanin
 
 MODEL_PATH="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 
@@ -99,5 +102,5 @@ python3 -m verl.trainer.main_ppo \
 	trainer.save_freq=-1 \
 	trainer.test_freq=9999 \
 	trainer.val_before_train=False \
-	trainer.total_training_steps=2 \
-	trainer.total_epochs=1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_p3_m6b_14b.txt
+	trainer.total_training_steps=1 \
+	trainer.total_epochs=1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee log_p3_m6b2_14b_fanin.txt
