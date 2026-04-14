@@ -401,6 +401,18 @@ class SGLangRollout(BaseRollout):
             self.config.multi_turn.max_user_turns = self.config.max_model_len // 3
 
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
+        # rlpipe dynamic-tp: opt-in via VERL_SGLANG_DYNAMIC_TP=1. Must set
+        # SGLANG_DYNAMIC_TP/INITIAL *before* AsyncEngine() spawns scheduler
+        # subprocesses so children inherit the env and the ModelRegistry
+        # alias (Qwen2/Qwen3 -> Qwen2DynamicForCausalLM) installs in each
+        # child at registry import time. INITIAL=tp avoids the LogitsProcessor
+        # gather-flag defect from task #25; we switch to dp post-init below.
+        self._rlpipe_dynamic_tp = os.environ.get("VERL_SGLANG_DYNAMIC_TP") == "1"
+        if self._rlpipe_dynamic_tp:
+            os.environ["SGLANG_DYNAMIC_TP"] = "1"
+            os.environ.setdefault("SGLANG_DYNAMIC_TP_INITIAL", "tp")
+            logger.info("rlpipe dynamic-tp: enabling in SGLangRollout")
+
         # initialize the inference engine
         nnodes = -(-self._tp_size // len(self.visible_devices_set))
         if nnodes > 1:
@@ -484,6 +496,20 @@ class SGLangRollout(BaseRollout):
                 self._engine = AsyncHttpServerAdapter(**args)
             else:
                 self._engine = AsyncEngine(**args)
+                # rlpipe dynamic-tp: after boot-in-tp, switch topology to dp
+                # so the rollout body runs in DP mode (each rank owns its
+                # own request subset, matching target_rank round-robin from
+                # TokenizerManager). The switch is <10 ms at Qwen3-1.7B and
+                # reuses the pre-captured CUDA graphs for both topologies.
+                if self._rlpipe_dynamic_tp:
+                    sw_result = self._engine.set_dynamic_topology("dp")
+                    assert sw_result.success, (
+                        f"rlpipe dynamic-tp: set_dynamic_topology(dp) failed: "
+                        f"{sw_result}"
+                    )
+                    logger.info(
+                        "rlpipe dynamic-tp: switched to dp topology after boot"
+                    )
         else:
             self._engine = None
 
