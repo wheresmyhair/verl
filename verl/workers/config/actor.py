@@ -204,6 +204,18 @@ class McoreActorConfig(ActorConfig):
     load_weight: bool = True
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)
+    # rlpipe: Megatron fused-forward Phase 1 MVP — short-circuits
+    # MegatronPPOActor.compute_log_prob through a local HF replica on each
+    # rank instead of the PP=4 forward_backward_func. Eliminates the
+    # dedicated compute_log_prob phase in one step. See
+    # verl/workers/actor/megatron_fused_inference.py.
+    use_fused_forward_pp: bool = False
+    use_fused_forward_pp_model_path: Optional[str] = None
+    use_fused_forward_pp_micro_batch_size: int = 4
+    # rlpipe: fused_update_actor — merges compute_log_prob + update_actor
+    # into a single call with one load/unload cycle. Requires
+    # use_fused_forward_pp=True (uses the HF replica for inference).
+    fused_forward: bool = False
 
 
 @dataclass

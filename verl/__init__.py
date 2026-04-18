@@ -20,6 +20,29 @@ from importlib.metadata import version as get_version
 
 from packaging.version import parse as parse_version
 
+# rlpipe: unblock CUDA IPC (pidfd_getfd) under restricted ptrace_scope.
+# Mirrors the fix in sglang/__init__.py. Needed for ray workers spawned
+# independently of the main process (they don't inherit the main
+# process's PR_SET_PTRACER). Silently ignored if prctl is unavailable.
+import os as _os
+import sys as _sys
+try:
+    import ctypes as _ctypes
+    _PR_SET_PTRACER = 0x59616d61
+    _PR_SET_PTRACER_ANY = -1
+    _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
+    _rc = _libc.prctl(_PR_SET_PTRACER, _PR_SET_PTRACER_ANY, 0, 0, 0)
+    _msg = f"[rlpipe prctl] pid={_os.getpid()} PR_SET_PTRACER_ANY rc={_rc}"
+    print(_msg, file=_sys.stderr, flush=True)
+    del _libc, _ctypes, _PR_SET_PTRACER, _PR_SET_PTRACER_ANY, _rc, _msg
+except Exception as _e:
+    print(
+        f"[rlpipe prctl] pid={_os.getpid()} FAILED: {_e}",
+        file=_sys.stderr,
+        flush=True,
+    )
+del _os, _sys
+
 from .protocol import DataProto
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs

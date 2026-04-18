@@ -1433,7 +1433,11 @@ class RayPPOTrainer:
             )
             next_step_profile = False
 
-            sample_lengths = {k: [[] for _ in range(self.config.trainer.total_epochs)] for k in range(len(self.train_dataset))} # rlpipe modification
+            from collections import defaultdict as _rlpipe_dd  # rlpipe: allow string-keyed sample indices (e.g. DAPO UUIDs)
+            sample_lengths = _rlpipe_dd(lambda: [[] for _ in range(self.config.trainer.total_epochs)])
+            # Seed with integer positions for GSM8K-style int indices; defaultdict handles UUID/string indices.
+            for k in range(len(self.train_dataset)):
+                sample_lengths[k] = [[] for _ in range(self.config.trainer.total_epochs)]
             # {sample_idx: [[lengths_ep0_n0, lengths_ep0_n1, ...], [lengths_ep1_n0, lengths_ep1_n1, ...], ...]}
             tp_groups = self.config.actor_rollout_ref.rollout.get("tp_groups", None)
             num_rollout_groups = len(tp_groups) if tp_groups else self.actor_rollout_wg.world_size
