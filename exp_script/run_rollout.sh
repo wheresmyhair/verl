@@ -1,1 +1,0 @@
-python exp_script/rollout_len.py > rollout_len.log 2>&1
