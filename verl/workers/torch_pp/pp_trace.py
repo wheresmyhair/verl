@@ -5,6 +5,11 @@ Produces a multi-row Perfetto visualization:
   1. Meta bar: high-level phases (rollout, inference, ref, training)
   2. Per-GPU bars: 1F1B operations (forward, backward, send, recv)
   3. HBM counters: per-GPU memory usage over time
+  4. GPU-util counters: NVML utilization / memory util, per-rank
+
+GPU utilization polling is started in begin_step and stopped in end_step
+so samples land inside the trace window. Configure via env var
+RLPIPE_GPU_UTIL_POLL_MS (default 100, 0 disables).
 
 Usage:
     tracer = PPTracer(pp_rank=rank, pp_size=4, save_dir="/path/to/traces")
@@ -28,6 +33,7 @@ Open the JSON in chrome://tracing or https://ui.perfetto.dev
 
 import json
 import os
+import threading
 import time
 from typing import Dict, List, Optional
 
@@ -62,6 +68,123 @@ _CATEGORY_COLORS = {
 }
 
 
+class _GpuUtilPoller:
+    """Background thread that polls NVML and appends Perfetto counter events.
+
+    Owned by a PPTracer. Thread-safety: relies on CPython's atomic
+    list.append; _ts_us reads _step_start/_time_offset_us which the main
+    thread writes only in begin_step *before* the poller starts.
+
+    Device identity assumes CUDA_VISIBLE_DEVICES is identity-mapped — we
+    resolve NVML handles by torch.cuda.current_device(). If the env
+    remaps devices (rare in worker processes), pass the NVML index
+    explicitly via gpu_util_device_index on PPTracer.
+    """
+
+    def __init__(self, tracer: "PPTracer", interval_ms: int, device_index: Optional[int] = None):
+        self.tracer = tracer
+        self.interval_s = interval_ms / 1000.0
+        self._device_index = device_index
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._backend: Optional[str] = None   # "nvml" | "smi"
+        self._handle = None
+        self._pynvml = None
+
+    def _resolve_device(self) -> int:
+        if self._device_index is not None:
+            return self._device_index
+        if torch.cuda.is_available():
+            return torch.cuda.current_device()
+        return 0
+
+    def _init_nvml(self) -> bool:
+        try:
+            import pynvml  # type: ignore
+            pynvml.nvmlInit()
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(self._resolve_device())
+            self._pynvml = pynvml
+            self._backend = "nvml"
+            return True
+        except Exception:
+            return False
+
+    def _sample_nvml(self) -> Optional[Dict]:
+        try:
+            u = self._pynvml.nvmlDeviceGetUtilizationRates(self._handle)
+            m = self._pynvml.nvmlDeviceGetMemoryInfo(self._handle)
+            return {
+                "utilization_pct": int(u.gpu),
+                "mem_util_pct": int(u.memory),
+                "mem_used_mb": int(m.used // (1024 * 1024)),
+            }
+        except Exception:
+            return None
+
+    def _sample_smi(self) -> Optional[Dict]:
+        import subprocess
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    f"--id={self._resolve_device()}",
+                    "--query-gpu=utilization.gpu,utilization.memory,memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                timeout=1.0,
+            ).decode().strip()
+            fields = [f.strip() for f in out.split(",")]
+            return {
+                "utilization_pct": int(fields[0]),
+                "mem_util_pct": int(fields[1]),
+                "mem_used_mb": int(fields[2]),
+            }
+        except Exception:
+            return None
+
+    def _loop(self):
+        sample_fn = self._sample_nvml if self._backend == "nvml" else self._sample_smi
+        while not self._stop.is_set():
+            t = time.perf_counter()
+            s = sample_fn()
+            if s is not None and self.tracer.enabled:
+                self.tracer.events.append({
+                    "name": "gpu_util",
+                    "cat": "gpu_util",
+                    "ph": "C",
+                    "ts": self.tracer._ts_us(t),
+                    "pid": f"6 GPU util GPU {self.tracer.pp_rank}",
+                    "tid": "nvml",
+                    "args": s,
+                })
+            self._stop.wait(self.interval_s)
+
+    def start(self):
+        if self.interval_s <= 0 or self._thread is not None:
+            return
+        if not self._init_nvml():
+            import shutil
+            if shutil.which("nvidia-smi") is None:
+                return
+            self._backend = "smi"
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="gpu_util_poller")
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+        if self._backend == "nvml" and self._pynvml is not None:
+            try:
+                self._pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._handle = None
+
+
 class PPTracer:
     """Collects timestamped events for one PP rank across an entire step."""
 
@@ -71,6 +194,8 @@ class PPTracer:
         pp_size: int,
         enabled: bool = True,
         save_dir: str = "/tmp/pp_traces",
+        gpu_util_poll_ms: Optional[int] = None,
+        gpu_util_device_index: Optional[int] = None,
     ):
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -81,12 +206,22 @@ class PPTracer:
         self._step: int = 0
         self._time_offset_us: float = 0.0
 
+        if gpu_util_poll_ms is None:
+            gpu_util_poll_ms = int(os.environ.get("RLPIPE_GPU_UTIL_POLL_MS", "100"))
+        self._gpu_util_poller = (
+            _GpuUtilPoller(self, gpu_util_poll_ms, gpu_util_device_index)
+            if gpu_util_poll_ms > 0
+            else None
+        )
+
     def begin_step(self, step: int, time_offset_us: float = 0.0):
         """Start a new step — clears events and records base timestamp."""
         self.events.clear()
         self._step = step
         self._step_start = time.perf_counter()
         self._time_offset_us = time_offset_us
+        if self._gpu_util_poller is not None and self.enabled:
+            self._gpu_util_poller.start()
 
     def _ts_us(self, t: float) -> float:
         """Convert absolute time to microseconds relative to step start."""
@@ -190,6 +325,8 @@ class PPTracer:
 
     def end_step(self):
         """Save trace for this step."""
+        if self._gpu_util_poller is not None:
+            self._gpu_util_poller.stop()
         if not self.enabled or not self.events:
             return
         os.makedirs(self.save_dir, exist_ok=True)
