@@ -169,15 +169,23 @@ class DualFleetFanInRollout(HetSGLangRollout):
         Only the TP leader launches anything. Other ranks participate in
         the TP engine through its internal scheduler subprocesses — they
         don't get their own Python-side handle.
+
+        DP URLs are broadcast from rank 0 to all TP ranks so each rank
+        can push weight updates to its own DP engine (rank i ↔ DP
+        engine i, both on physical GPU i). This sidesteps needing a
+        cross-GPU IPC handle transfer from rank 0.
         """
         # First: let the parent class launch the TP engine into self._engine.
         super()._init_inference_engine(trust_remote_code, actor_module, port)
 
         if self._tp_rank != 0:
-            # Non-leader ranks have no engines. They'll receive broadcasts.
+            # Non-leader ranks have no engines of their own but still
+            # receive the DP URL broadcast so they can push weight
+            # updates to their own DP engine.
             self._dp_fleet: List[Any] = []
             self._fanin_coord = None
             self._fanin_orch = None
+            self._receive_dp_urls_broadcast()
             return
 
         # TP leader: launch 4 DP engines, one per GPU.
@@ -303,6 +311,10 @@ class DualFleetFanInRollout(HetSGLangRollout):
                 f"(idle_threshold={idle_threshold})"
             )
 
+            # Broadcast DP URLs to all TP ranks so each rank has a
+            # handle for its own DP engine weight updates.
+            self._broadcast_dp_urls()
+
         except Exception as exc:
             raise RuntimeError(
                 f"DualFleet DP fleet init failed: rank={self._rank}"
@@ -344,32 +356,131 @@ class DualFleetFanInRollout(HetSGLangRollout):
         finally:
             self._engine = saved_engine
 
+    # ---------- DP URL broadcast (called from _init_inference_engine) ----------
+
+    def _broadcast_dp_urls(self):
+        """Rank 0: collect URLs of the DP fleet and broadcast to all TP
+        ranks. Each rank then stores self._my_dp_url pointing to "its"
+        DP engine (rank i ↔ DP engine i, both on physical GPU i)."""
+        urls = [
+            f"http://{eng.server_args.host}:{eng.server_args.port}"
+            for eng in self._dp_fleet
+        ]
+        obj_list = [urls]
+        tp_group = self._device_mesh_cpu["tp"].get_group()
+        src = dist.distributed_c10d.get_global_rank(tp_group, 0)
+        dist.broadcast_object_list(obj_list, src=src, group=tp_group)
+        self._dp_urls: List[str] = obj_list[0]
+        self._my_dp_url: Optional[str] = (
+            self._dp_urls[self._tp_rank] if self._dp_urls else None
+        )
+
+    def _receive_dp_urls_broadcast(self):
+        """Non-leader ranks: receive the DP URL list from rank 0."""
+        obj_list: List[Any] = [None]
+        tp_group = self._device_mesh_cpu["tp"].get_group()
+        src = dist.distributed_c10d.get_global_rank(tp_group, 0)
+        dist.broadcast_object_list(obj_list, src=src, group=tp_group)
+        self._dp_urls = obj_list[0] or []
+        self._my_dp_url = (
+            self._dp_urls[self._tp_rank] if self._dp_urls else None
+        )
+
     # ---------- update_weights override ----------
 
     async def update_weights(self, weights, **kwargs):
-        """Update weights on the TP engine only (MVP).
+        """Update weights on BOTH the TP engine and each DP engine.
 
-        The DP fleet is NOT updated here. Reason: the `weights` generator
-        from `_collect_full_state_dict` yields tensors after cross-rank
-        `dist.broadcast` collectives. To iterate it more than once we'd
-        need every rank to iterate in lockstep — which breaks the simple
-        "rank 0 fans out" model, because non-leader ranks exit
-        `update_weights` after one pass.
+        Iteration structure: `weights` is a generator from
+        torch_pp's `_collect_full_state_dict` that yields each param
+        tensor after a cross-rank `dist.broadcast` — so it MUST be
+        consumed in lockstep across all TP ranks. We iterate it once,
+        bucket-by-bucket, and for each bucket do:
 
-        Known consequence: the DP fleet keeps its initial (load_format=
-        dummy) weights and produces garbage tokens during bulk rollout.
-        The TP engine — which actually runs the tail fan-in — has correct
-        weights. For end-to-end training correctness we need proper DP
-        update. See TODO below.
+          (a) TP update via the existing `sgl_update_weights` path:
+              all ranks gather_object, then rank 0's TP engine does
+              `update_weights_from_tensor`.
 
-        TODO(dual-fleet-weights): implement per-DP-engine update by
-        buffering the gathered tensors on rank 0, copying each to the
-        matching GPU (cuda:i for engine i), serializing via
-        MultiprocessingSerializer, and calling the DP engine's
-        update_weights_from_tensor directly (bypassing the device-mesh
-        gather inside sgl_update_weights, since DP engines are tp_size=1).
+          (b) DP update: each rank pushes its bucket to its own DP
+              engine. Since `_collect_full_state_dict` broadcasts each
+              full tensor to every rank's GPU, each rank has a local
+              copy to serialize via CUDA IPC — no extra collective
+              needed. Rank i ↔ DP engine i, both on physical GPU i.
         """
-        await super().update_weights(weights, **kwargs)
+        from sglang.srt.utils.common import MultiprocessingSerializer
+        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+        from sglang.srt.weight_sync.utils import (
+            _preprocess_tensor_for_update_weights,
+            update_weights as sgl_update_weights,
+        )
+        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+        from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
+
+        bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
+
+        for bucket in get_named_tensor_buckets(weights, bucket_bytes):
+            # (a) TP update — all ranks participate via gather_object.
+            await sgl_update_weights(
+                engine=self._engine,
+                params_batch=bucket,
+                device_mesh_key="infer_tp",
+                device_mesh=self.device_mesh,
+            )
+
+            # (b) DP update on each rank, in parallel (this rank → its DP engine).
+            await self._update_own_dp_engine(bucket)
+
+        if self._tp_rank == 0 and self._engine is not None:
+            await self._engine.flush_cache()
+            # Flush each DP engine too so stale KV from any earlier
+            # prefill doesn't leak into the fresh-weights rollout.
+            for eng in self._dp_fleet:
+                await eng.flush_cache()
+
+    async def _update_own_dp_engine(self, bucket):
+        """Serialize this rank's tensors for its bucket and push to
+        this rank's DP engine via HTTP POST /update_weights_from_tensor.
+
+        Safe no-op if this rank has no DP URL (shouldn't happen once
+        _broadcast_dp_urls has run, but defensive)."""
+        if not getattr(self, "_my_dp_url", None):
+            return
+        import base64
+        import aiohttp
+        from sglang.srt.utils.common import MultiprocessingSerializer
+        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+        from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
+
+        named_tensors = [
+            (
+                name,
+                LocalSerializedTensor(values=[
+                    MultiprocessingSerializer.serialize(
+                        _preprocess_tensor_for_update_weights(t.detach())
+                    )
+                ]),
+            )
+            for name, t in bucket
+        ]
+        blob = MultiprocessingSerializer.serialize(named_tensors)
+        body = {
+            "serialized_named_tensors": [base64.b64encode(blob).decode("utf-8")],
+            "load_format": None,
+            "flush_cache": False,
+        }
+        timeout = aiohttp.ClientTimeout(total=600)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{self._my_dp_url}/update_weights_from_tensor",
+                json=body,
+            ) as resp:
+                if resp.status >= 400:
+                    txt = await resp.text()
+                    raise RuntimeError(
+                        f"DP update_weights_from_tensor failed on rank "
+                        f"{self._tp_rank} (url={self._my_dp_url}): "
+                        f"status={resp.status} body={txt[:500]}"
+                    )
 
     def __del__(self):
         for eng in getattr(self, "_dp_fleet", []) or []:
