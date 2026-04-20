@@ -190,6 +190,12 @@ class RolloutConfig(BaseConfig):
     # None or 1.0 = disabled (default, wait for all). 0.9 = return when 90% done.
     progressive_threshold: Optional[float] = None
 
+    # rlpipe dual-fleet fan-in rollout. When True, _build_rollout_heterogeneous
+    # picks DualFleetFanInRollout which launches 4 DP HTTP servers + 1 TP
+    # HTTP server on the TP leader and orchestrates dynamic DP→TP swap on
+    # tail. Requires tp_groups=[[0,1,2,3]] (single TP group).
+    enable_dual_fleet_fanin: bool = False
+
     sglang_engine_mode: str = "local"
 
     limit_images: Optional[int] = None

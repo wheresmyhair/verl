@@ -270,11 +270,21 @@ class DualFleetFanInRollout(HetSGLangRollout):
             from sglang.srt.utils.rlpipe_dual_fleet import DualFleetCoordinator
             from sglang.srt.utils.rlpipe_fan_in import DynamicFanInOrchestrator
 
+            # auto_pause_inactive=False + memory_managed_externally=True:
+            # verl's torch_pp_workers.rollout_mode already resumes
+            # TP weights+kv_cache before rollout starts. If the
+            # coordinator also called release_memory_occupation /
+            # resume_memory_occupation on TP during swap, it would
+            # hit a KeyError on an already-resident tag. So at rollout
+            # time both fleets are resident (no HBM savings from the
+            # swap) and the "swap" is a pure routing flip. Proper
+            # HBM management is a follow-up.
             self._fanin_coord = DualFleetCoordinator(
                 dp_engines=self._dp_fleet,
                 tp_engines=[self._engine],
                 initial_active="dp",
-                auto_pause_inactive=True,  # pause TP at boot so DP is active
+                auto_pause_inactive=False,
+                memory_managed_externally=True,
             )
 
             idle_threshold = int(
@@ -337,59 +347,29 @@ class DualFleetFanInRollout(HetSGLangRollout):
     # ---------- update_weights override ----------
 
     async def update_weights(self, weights, **kwargs):
-        """Fan out weight updates to every engine in the dual fleet.
+        """Update weights on the TP engine only (MVP).
 
-        Naive MVP: serial across engines. Each update_weights call
-        iterates the weights generator once, so we need to materialize
-        weight buckets into memory per-engine OR use a tee. The simpler
-        path: run the parent class's update once per engine by making a
-        fresh generator each time — but the caller hands us a single
-        generator which can only be iterated once.
+        The DP fleet is NOT updated here. Reason: the `weights` generator
+        from `_collect_full_state_dict` yields tensors after cross-rank
+        `dist.broadcast` collectives. To iterate it more than once we'd
+        need every rank to iterate in lockstep — which breaks the simple
+        "rank 0 fans out" model, because non-leader ranks exit
+        `update_weights` after one pass.
 
-        Workaround: materialize the generator once into a list of
-        tensors, then re-iterate per engine. Memory cost ≈ full model
-        params (already true of the source anyway). Follow-up work could
-        overlap engine updates via asyncio or reuse NCCL buckets.
+        Known consequence: the DP fleet keeps its initial (load_format=
+        dummy) weights and produces garbage tokens during bulk rollout.
+        The TP engine — which actually runs the tail fan-in — has correct
+        weights. For end-to-end training correctness we need proper DP
+        update. See TODO below.
+
+        TODO(dual-fleet-weights): implement per-DP-engine update by
+        buffering the gathered tensors on rank 0, copying each to the
+        matching GPU (cuda:i for engine i), serializing via
+        MultiprocessingSerializer, and calling the DP engine's
+        update_weights_from_tensor directly (bypassing the device-mesh
+        gather inside sgl_update_weights, since DP engines are tp_size=1).
         """
-        if self._tp_rank != 0:
-            # Non-leader ranks still participate in the parent's NCCL
-            # update to the TP engine (existing behavior).
-            await super().update_weights(weights, **kwargs)
-            return
-
-        weights_list = list(weights)  # materialize once
-
-        def _weights_iter():
-            for item in weights_list:
-                yield item
-
-        # First: TP engine via super (preserves existing NCCL path).
-        await super().update_weights(_weights_iter(), **kwargs)
-
-        # Then: each DP engine. They're independent HTTP servers, each
-        # with its own NCCL group/process. The simplest way is to go
-        # through AsyncHttpServerAdapter's update_weights API — but that
-        # currently expects a specific dispatch mode tied to self.device_mesh.
-        # For MVP, call the raw tokenizer endpoint per engine.
-        # TODO: use sgl_update_weights pattern (needs per-engine device_mesh).
-        logger_ = __import__("logging").getLogger(__name__)
-        for idx, eng in enumerate(self._dp_fleet):
-            try:
-                # Re-use the TP-side engine's update mechanism by setting
-                # self._engine = eng temporarily, then calling super's
-                # update_weights. Each call consumes the generator once.
-                saved = self._engine
-                self._engine = eng
-                try:
-                    await super().update_weights(_weights_iter(), **kwargs)
-                finally:
-                    self._engine = saved
-                logger_.info(f"[dual-fleet] update_weights DP engine {idx} done")
-            except Exception as e:
-                logger_.exception(
-                    f"[dual-fleet] update_weights DP engine {idx} failed: {e}"
-                )
-                raise
+        await super().update_weights(weights, **kwargs)
 
     def __del__(self):
         for eng in getattr(self, "_dp_fleet", []) or []:
