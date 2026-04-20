@@ -278,21 +278,18 @@ class DualFleetFanInRollout(HetSGLangRollout):
             from sglang.srt.utils.rlpipe_dual_fleet import DualFleetCoordinator
             from sglang.srt.utils.rlpipe_fan_in import DynamicFanInOrchestrator
 
-            # auto_pause_inactive=False + memory_managed_externally=True:
-            # verl's torch_pp_workers.rollout_mode already resumes
-            # TP weights+kv_cache before rollout starts. If the
-            # coordinator also called release_memory_occupation /
-            # resume_memory_occupation on TP during swap, it would
-            # hit a KeyError on an already-resident tag. So at rollout
-            # time both fleets are resident (no HBM savings from the
-            # swap) and the "swap" is a pure routing flip. Proper
-            # HBM management is a follow-up.
+            # auto_pause_inactive=False: both fleets start live. verl's
+            # rollout_mode has already resumed TP weights+kv_cache. The
+            # coordinator's release/resume are now idempotent (errors on
+            # already-live/already-paused are swallowed with a warning),
+            # so swap_topology can safely release the inactive fleet and
+            # resume the target — this is what buys the HBM saving.
             self._fanin_coord = DualFleetCoordinator(
                 dp_engines=self._dp_fleet,
                 tp_engines=[self._engine],
                 initial_active="dp",
                 auto_pause_inactive=False,
-                memory_managed_externally=True,
+                memory_managed_externally=False,
             )
 
             idle_threshold = int(
@@ -339,6 +336,13 @@ class DualFleetFanInRollout(HetSGLangRollout):
         construction, result assembly, broadcast) runs unchanged, but the
         engine call is intercepted by the facade and routed through the
         orchestrator.
+
+        HBM lifecycle: at entry we release TP so only DP holds HBM
+        during bulk generation (the biggest phase). The orchestrator
+        then handles DP↔TP via swap_topology as usual. At exit the
+        orchestrator has swap_back_after=True, so state is DP-live,
+        TP-released; we resume TP so verl's subsequent trainer_mode
+        release() sees the expected "live" state.
         """
         if self._tp_rank != 0:
             # Non-leader: no engine, just receive broadcast.
@@ -346,6 +350,9 @@ class DualFleetFanInRollout(HetSGLangRollout):
 
         if self._fanin_orch is None:
             return super()._batch_level_generate_sequences(prompts, **kwargs)
+
+        # Bulk-phase HBM saving: DP is active; free TP now.
+        self._fanin_coord._release_fleet("tp")
 
         saved_engine = self._engine
         facade = _FanInEngineFacade(self._fanin_orch)
@@ -355,6 +362,9 @@ class DualFleetFanInRollout(HetSGLangRollout):
             return super()._batch_level_generate_sequences(prompts, **kwargs)
         finally:
             self._engine = saved_engine
+            # Restore TP to the "live" state verl expects for its
+            # trainer_mode release path.
+            self._fanin_coord._resume_fleet("tp")
 
     # ---------- DP URL broadcast (called from _init_inference_engine) ----------
 
