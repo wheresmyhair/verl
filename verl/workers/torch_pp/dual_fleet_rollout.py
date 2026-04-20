@@ -444,33 +444,47 @@ class DualFleetFanInRollout(HetSGLangRollout):
             return super()._batch_level_generate_sequences(prompts, **kwargs)
         finally:
             self._engine = saved_engine
-            # Restore TP to the "live" state verl expects for its
-            # trainer_mode release path.
-            self._fanin_coord._resume_fleet("tp")
+            # Do NOT resume TP KV here — it would exceed HBM when combined
+            # with DP KV at common gmu values. The release() override uses
+            # the coordinator's state tracker so redundant release on
+            # already-paused TP KV is safely skipped.
 
     # ---------- lifecycle overrides (resume / release) ----------
 
     async def resume(self, tags=None):
-        """Resume TP (via super) AND DP fleet. verl's rollout_mode calls
-        resume(['weights']) and resume(['kv_cache']) separately; both
-        fleets need to be awake for update_weights and generate_sequences.
-        State tracking keeps calls idempotent across the two tag subsets."""
-        await super().resume(tags=tags)
+        """Resume TP weights AND DP fleet (weights + KV as requested).
+
+        We intentionally DO NOT resume TP kv_cache here. Reason: the bulk
+        rollout phase runs on DP. If both TP KV and DP KV are resumed
+        simultaneously (5 engines × gpu_memory_utilization × HBM), total
+        HBM demand exceeds GPU capacity at common configs (e.g. 1.7B at
+        gmu=0.5: 84GB > 80GB per A100). TP KV is resumed later by the
+        orchestrator when it actually swaps to TP for the tail phase.
+
+        Non-leader ranks: super() is a no-op since self._engine is None;
+        no DP fleet to resume.
+        """
+        req_tags = list(tags) if tags is not None else ["weights", "kv_cache"]
+        # Only forward the weights tag to super's TP resume.
+        tp_tags = [t for t in req_tags if t == "weights"]
+        if tp_tags:
+            await super().resume(tags=tp_tags)
+            if self._tp_rank == 0 and getattr(self, "_fanin_coord", None) is not None:
+                for t in tp_tags:
+                    self._fanin_coord.assume_state(self._engine, t, "live")
+        # DP fleet: resume exactly the requested tags.
         if self._tp_rank == 0 and getattr(self, "_fanin_coord", None) is not None:
-            # Sync: super's resume on TP took those tags live.
-            for t in (tags or ("weights", "kv_cache")):
-                self._fanin_coord.assume_state(self._engine, t, "live")
-            # Resume DP fleet (coordinator handles state tracking internally).
-            self._fanin_coord._resume_fleet("dp")
+            self._fanin_coord._resume_fleet("dp", tags=req_tags)
 
     async def release(self):
-        """Release TP (via super) AND DP fleet. Called by verl's
-        trainer_mode at end of rollout."""
-        await super().release()
+        """Release TP AND DP fleet via the coordinator so state tracking
+        is respected. We do NOT call super().release() because that path
+        calls release_memory_occupation on both tags unconditionally,
+        which hangs the scheduler if a tag is already paused (common: we
+        skip TP kv_cache resume in resume() above, so TP KV is paused
+        throughout rollout)."""
         if self._tp_rank == 0 and getattr(self, "_fanin_coord", None) is not None:
-            # Sync: super's release on TP paused both tags.
-            for t in ("weights", "kv_cache"):
-                self._fanin_coord.assume_state(self._engine, t, "paused")
+            self._fanin_coord._release_fleet("tp")
             self._fanin_coord._release_fleet("dp")
 
     # ---------- DP URL broadcast (called from _init_inference_engine) ----------
