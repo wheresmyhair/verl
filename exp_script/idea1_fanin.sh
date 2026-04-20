@@ -35,7 +35,11 @@ export VERL_RLPIPE_FANIN_IDLE_THRESHOLD=${VERL_RLPIPE_FANIN_IDLE_THRESHOLD:-2}
 
 ENGINE=sglang
 ROLLOUT_TP=4
-GPU_MEMORY_UTILIZATION=0.5  # dual-topology pre-capture needs headroom
+# Each fleet sees gpu_memory_utilization × HBM. With dual-fleet resident
+# at launch (both TP and DP being spun up), and live during rollout
+# (bulk DP + KV pool), this must be low enough that 5 engines × gmu
+# does not exceed 1.0. Override via env for larger models.
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}
 
 python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch_pp_trainer' \
 	algorithm.adv_estimator=grpo \

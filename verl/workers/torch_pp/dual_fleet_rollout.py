@@ -178,6 +178,33 @@ class DualFleetFanInRollout(HetSGLangRollout):
         # First: let the parent class launch the TP engine into self._engine.
         super()._init_inference_engine(trust_remote_code, actor_module, port)
 
+        # Release the TP engine before launching DP fleet. At 8B+ scale,
+        # TP live (weights + KV pool at gpu_memory_utilization) plus a
+        # single launching DP engine exceeds HBM per GPU. We pause TP,
+        # launch DP one at a time (each released immediately post-launch),
+        # then resume TP at the end. Final resting state: TP live, DP all
+        # paused. The coordinator's resume()/release() overrides later
+        # manage the full lifecycle.
+        if self._tp_rank == 0 and self._engine is not None:
+            try:
+                import asyncio as _asyncio
+                _loop = _asyncio.new_event_loop()
+                try:
+                    _loop.run_until_complete(
+                        self._engine.release_memory_occupation(
+                            tags=["weights", "kv_cache"]
+                        )
+                    )
+                finally:
+                    _loop.close()
+                logger.info("[DualFleet] TP engine released during DP fleet init")
+            except Exception as e:
+                logger.warning(
+                    f"[DualFleet] TP release before DP launch failed "
+                    f"({type(e).__name__}: {e}) — continuing; 8B+ configs "
+                    "may OOM during DP launch"
+                )
+
         if self._tp_rank != 0:
             # Non-leader ranks have no engines of their own but still
             # receive the DP URL broadcast so they can push weight
@@ -270,6 +297,30 @@ class DualFleetFanInRollout(HetSGLangRollout):
                     f"base_gpu_id={i} port={args['port']} nccl_port={args['nccl_port']}"
                 )
                 eng = AsyncHttpServerAdapter(**args)
+                # Release this DP engine's HBM immediately so the next
+                # engine can launch without OOMing. At 8B scale, 4 live
+                # DP engines + 1 live TP engine all at gpu_memory_utilization
+                # would claim >100% of HBM per GPU. The coordinator resumes
+                # DP at rollout entry and releases at rollout exit, so this
+                # paused state is the normal resting state between rollouts.
+                try:
+                    import asyncio as _asyncio
+                    _loop = _asyncio.new_event_loop()
+                    try:
+                        _loop.run_until_complete(
+                            eng.release_memory_occupation(
+                                tags=list(("weights", "kv_cache"))
+                            )
+                        )
+                    finally:
+                        _loop.close()
+                    logger.info(f"[DualFleet] DP engine {i} released to CPU backup")
+                except Exception as e:
+                    logger.warning(
+                        f"[DualFleet] DP engine {i} initial release failed: "
+                        f"{type(e).__name__}: {e} — continuing; HBM headroom "
+                        "may be insufficient"
+                    )
                 self._dp_fleet.append(eng)
 
             logger.info(f"[DualFleet] all {dp_size} DP engines launched")
@@ -291,6 +342,15 @@ class DualFleetFanInRollout(HetSGLangRollout):
                 auto_pause_inactive=False,
                 memory_managed_externally=False,
             )
+            # Sync state: we've already released all DP engines post-launch
+            # and TP remains released until the end-of-init resume call
+            # below. The coordinator tracks this so subsequent redundant
+            # release/resume calls are skipped (prevents scheduler hangs).
+            for eng in self._dp_fleet:
+                for tag in ("weights", "kv_cache"):
+                    self._fanin_coord.assume_state(eng, tag, "paused")
+            for tag in ("weights", "kv_cache"):
+                self._fanin_coord.assume_state(self._engine, tag, "paused")
 
             idle_threshold = int(
                 os.environ.get(
@@ -311,6 +371,28 @@ class DualFleetFanInRollout(HetSGLangRollout):
             # Broadcast DP URLs to all TP ranks so each rank has a
             # handle for its own DP engine weight updates.
             self._broadcast_dp_urls()
+
+            # Resume TP now that all DP engines are launched-and-paused.
+            # verl's first trainer_mode will release TP again momentarily.
+            try:
+                import asyncio as _asyncio
+                _loop = _asyncio.new_event_loop()
+                try:
+                    _loop.run_until_complete(
+                        self._engine.resume_memory_occupation(
+                            tags=["weights", "kv_cache"]
+                        )
+                    )
+                finally:
+                    _loop.close()
+                for tag in ("weights", "kv_cache"):
+                    self._fanin_coord.assume_state(self._engine, tag, "live")
+                logger.info("[DualFleet] TP engine resumed after DP fleet init")
+            except Exception as e:
+                logger.warning(
+                    f"[DualFleet] TP resume after DP launch failed "
+                    f"({type(e).__name__}: {e})"
+                )
 
         except Exception as exc:
             raise RuntimeError(
@@ -365,6 +447,31 @@ class DualFleetFanInRollout(HetSGLangRollout):
             # Restore TP to the "live" state verl expects for its
             # trainer_mode release path.
             self._fanin_coord._resume_fleet("tp")
+
+    # ---------- lifecycle overrides (resume / release) ----------
+
+    async def resume(self, tags=None):
+        """Resume TP (via super) AND DP fleet. verl's rollout_mode calls
+        resume(['weights']) and resume(['kv_cache']) separately; both
+        fleets need to be awake for update_weights and generate_sequences.
+        State tracking keeps calls idempotent across the two tag subsets."""
+        await super().resume(tags=tags)
+        if self._tp_rank == 0 and getattr(self, "_fanin_coord", None) is not None:
+            # Sync: super's resume on TP took those tags live.
+            for t in (tags or ("weights", "kv_cache")):
+                self._fanin_coord.assume_state(self._engine, t, "live")
+            # Resume DP fleet (coordinator handles state tracking internally).
+            self._fanin_coord._resume_fleet("dp")
+
+    async def release(self):
+        """Release TP (via super) AND DP fleet. Called by verl's
+        trainer_mode at end of rollout."""
+        await super().release()
+        if self._tp_rank == 0 and getattr(self, "_fanin_coord", None) is not None:
+            # Sync: super's release on TP paused both tags.
+            for t in ("weights", "kv_cache"):
+                self._fanin_coord.assume_state(self._engine, t, "paused")
+            self._fanin_coord._release_fleet("dp")
 
     # ---------- DP URL broadcast (called from _init_inference_engine) ----------
 
