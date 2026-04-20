@@ -648,10 +648,27 @@ class ActorRolloutRefWorker(Worker):
         # 6. Override config tp_size for this group
         rollout_config.tensor_model_parallel_size = my_tp_size
 
-        # 7. Build heterogeneous SGLang rollout
+        # 7. Build heterogeneous SGLang rollout. Dual-fleet fan-in path
+        #    is opt-in via config flag; requires a single TP group
+        #    (tp_groups=[[0,1,2,3]]) so rank 0 is the leader that spawns
+        #    both the TP and DP fleets.
         log_gpu_memory_usage("Before building het SGLang rollout", logger=logger)
+        enable_dual_fleet = bool(
+            self.config.rollout.get("enable_dual_fleet_fanin", False)
+        )
+        if enable_dual_fleet and len(tp_groups) != 1:
+            raise ValueError(
+                f"enable_dual_fleet_fanin=True requires a single TP group, "
+                f"got tp_groups={tp_groups}"
+            )
         try:
-            self.rollout = HetSGLangRollout(
+            if enable_dual_fleet:
+                from verl.workers.torch_pp.dual_fleet_rollout import DualFleetFanInRollout
+                rollout_cls = DualFleetFanInRollout
+                logger.info("[Het TP] using DualFleetFanInRollout (rlpipe fan-in)")
+            else:
+                rollout_cls = HetSGLangRollout
+            self.rollout = rollout_cls(
                 config=rollout_config,
                 model_config=model_config,
                 device_mesh=rollout_device_mesh,

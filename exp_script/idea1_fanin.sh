@@ -1,11 +1,17 @@
 #!/bin/bash
-# Idea 1: DP→TP fan-in rollout using the rlpipe SGLang fork.
+# Idea 1: dual-fleet DP→TP fan-in rollout.
 #
-# Starts with DP=4 (each GPU holds a full weight replica), then the fork
-# switches to TP=4 for the tail once the active-request count drops below
-# VERL_RLPIPE_FANIN_MIN_IDLE. The switch is implemented by
-# torch_memory_saver pause/resume on per-topology tags
-# (weights_dp/weights_tp, kv_cache_dp/kv_cache_tp, cuda_graph_dp/cuda_graph_tp).
+# Rank 0 (TP leader of a single-group tp_groups=[[0,1,2,3]]) launches FIVE
+# SGLang HTTP servers via AsyncHttpServerAdapter: 1 TP engine (tp_size=4,
+# spans all 4 GPUs) + 4 DP engines (tp_size=1 each, one per GPU).
+# DualFleetCoordinator manages release/resume so only one fleet's weights
+# are resident at a time. DynamicFanInOrchestrator watches DP in-flight
+# count during rollout; when VERL_RLPIPE_FANIN_IDLE_THRESHOLD workers go
+# idle it aborts stragglers, swaps to TP, re-prefills on TP.
+#
+# See verl/workers/torch_pp/dual_fleet_rollout.py for the rollout class,
+# sglang-fork/rlpipe_smoke/smoke_e7_dynamic_fanin.py for the standalone
+# algorithm probe.
 #
 # Pairs with idea1_baseline.sh (vanilla SGLang DP=4). Training side is
 # kept identical: torch_pp + fused_forward=True.
@@ -22,17 +28,10 @@ PROFILING_DIR=$PROFILING_ROOT/$EXP_NAME/seed_${SEED}
 rm -rf "$PROFILING_DIR"
 mkdir -p "$PROFILING_DIR"
 
-# Fan-in control (fork + verl integration).
-export VERL_SGLANG_DYNAMIC_TP=1
-export VERL_RLPIPE_FANIN=1
-export VERL_RLPIPE_FANIN_MIN_IDLE=1
-export SGLANG_DYNAMIC_TP_PRE_CAPTURE=1
-export SGLANG_DYNAMIC_TP_INITIAL=dp
-
-# Trace output for the fork-side fan-in controller.
-export RLPIPE_SGFANIN_TRACE=$PROFILING_DIR/sgfanin_trace
-export RLPIPE_SGFANIN_FANIN_DEBUG=$PROFILING_DIR/fanin_debug.log
-mkdir -p $RLPIPE_SGFANIN_TRACE
+# Dual-fleet fan-in control. `enable_dual_fleet_fanin` flag (config, below)
+# picks DualFleetFanInRollout. idle_threshold=2 means swap when 2 of 4 DP
+# workers are idle (i.e. 2 stragglers remain).
+export VERL_RLPIPE_FANIN_IDLE_THRESHOLD=${VERL_RLPIPE_FANIN_IDLE_THRESHOLD:-2}
 
 ENGINE=sglang
 ROLLOUT_TP=4
@@ -64,6 +63,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
 	actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
 	++actor_rollout_ref.rollout.tp_groups=[[0,1,2,3]] \
+	++actor_rollout_ref.rollout.enable_dual_fleet_fanin=true \
 	actor_rollout_ref.rollout.name=$ENGINE \
 	actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
 	actor_rollout_ref.rollout.n=$N_SAMPLES \

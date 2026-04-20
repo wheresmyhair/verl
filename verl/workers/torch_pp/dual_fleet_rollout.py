@@ -137,18 +137,22 @@ class _FanInEngineFacade:
         results, tel = await loop.run_in_executor(
             None, self._orch.rollout, requests
         )
-        # Results are RolloutResult dataclasses; return the raw engine dicts
-        # in batch order.
+        # Each RolloutResult carries the raw engine dict (meta_info,
+        # output_ids, output_token_logprobs, etc). Return them in batch
+        # order so callers unpacking engine-style lists get the right
+        # thing.
         out_dicts = []
         for r in results:
-            if hasattr(r, "text"):  # RolloutResult
-                # RolloutResult doesn't carry the raw dict; reconstruct
-                # minimally. Callers that need output_ids should use
-                # the orchestrator directly; for text-only downstream
-                # this is sufficient.
-                out_dicts.append({"text": r.text or "", "meta_info": {}})
+            if r.raw is not None:
+                out_dicts.append(r.raw)
             else:
-                out_dicts.append(r)
+                out_dicts.append({"text": r.text or "", "meta_info": {}})
+        import logging
+        logging.getLogger(__name__).info(
+            f"[dual-fleet] rollout done: n={len(results)} swap={tel.swap_triggered} "
+            f"dp={tel.n_finished_on_dp} tp={tel.n_finished_on_tp} "
+            f"wall={tel.total_wall_s:.3f}s"
+        )
         return out_dicts
 
 
@@ -301,6 +305,91 @@ class DualFleetFanInRollout(HetSGLangRollout):
             os.environ.update(saved)
             if _orig_launch is not None:
                 _engine_mod.launch_server = _orig_launch
+
+    # ---------- generate override ----------
+
+    def _batch_level_generate_sequences(self, prompts, **kwargs):
+        """Route through the fan-in orchestrator on TP leader; non-leader
+        ranks fall through to the parent's broadcast-receive path.
+
+        Implementation: temporarily swap self._engine with the facade so
+        the parent class's logic (prompt-preprocessing, sampling-params
+        construction, result assembly, broadcast) runs unchanged, but the
+        engine call is intercepted by the facade and routed through the
+        orchestrator.
+        """
+        if self._tp_rank != 0:
+            # Non-leader: no engine, just receive broadcast.
+            return super()._batch_level_generate_sequences(prompts, **kwargs)
+
+        if self._fanin_orch is None:
+            return super()._batch_level_generate_sequences(prompts, **kwargs)
+
+        saved_engine = self._engine
+        facade = _FanInEngineFacade(self._fanin_orch)
+        facade.set_fallback(saved_engine)
+        self._engine = facade
+        try:
+            return super()._batch_level_generate_sequences(prompts, **kwargs)
+        finally:
+            self._engine = saved_engine
+
+    # ---------- update_weights override ----------
+
+    async def update_weights(self, weights, **kwargs):
+        """Fan out weight updates to every engine in the dual fleet.
+
+        Naive MVP: serial across engines. Each update_weights call
+        iterates the weights generator once, so we need to materialize
+        weight buckets into memory per-engine OR use a tee. The simpler
+        path: run the parent class's update once per engine by making a
+        fresh generator each time — but the caller hands us a single
+        generator which can only be iterated once.
+
+        Workaround: materialize the generator once into a list of
+        tensors, then re-iterate per engine. Memory cost ≈ full model
+        params (already true of the source anyway). Follow-up work could
+        overlap engine updates via asyncio or reuse NCCL buckets.
+        """
+        if self._tp_rank != 0:
+            # Non-leader ranks still participate in the parent's NCCL
+            # update to the TP engine (existing behavior).
+            await super().update_weights(weights, **kwargs)
+            return
+
+        weights_list = list(weights)  # materialize once
+
+        def _weights_iter():
+            for item in weights_list:
+                yield item
+
+        # First: TP engine via super (preserves existing NCCL path).
+        await super().update_weights(_weights_iter(), **kwargs)
+
+        # Then: each DP engine. They're independent HTTP servers, each
+        # with its own NCCL group/process. The simplest way is to go
+        # through AsyncHttpServerAdapter's update_weights API — but that
+        # currently expects a specific dispatch mode tied to self.device_mesh.
+        # For MVP, call the raw tokenizer endpoint per engine.
+        # TODO: use sgl_update_weights pattern (needs per-engine device_mesh).
+        logger_ = __import__("logging").getLogger(__name__)
+        for idx, eng in enumerate(self._dp_fleet):
+            try:
+                # Re-use the TP-side engine's update mechanism by setting
+                # self._engine = eng temporarily, then calling super's
+                # update_weights. Each call consumes the generator once.
+                saved = self._engine
+                self._engine = eng
+                try:
+                    await super().update_weights(_weights_iter(), **kwargs)
+                finally:
+                    self._engine = saved
+                logger_.info(f"[dual-fleet] update_weights DP engine {idx} done")
+            except Exception as e:
+                logger_.exception(
+                    f"[dual-fleet] update_weights DP engine {idx} failed: {e}"
+                )
+                raise
 
     def __del__(self):
         for eng in getattr(self, "_dp_fleet", []) or []:
