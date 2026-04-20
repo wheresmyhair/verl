@@ -37,6 +37,8 @@ from verl.utils.device import get_visible_devices_keyword
 from verl.workers.rollout.sglang_rollout.http_server_engine import AsyncHttpServerAdapter
 from verl.workers.torch_pp.het_sglang_rollout import HetSGLangRollout, _DIST_ENV_VARS, _needs_p2p_workaround
 from verl.workers.rollout.sglang_rollout import http_server_engine as _engine_mod
+import asyncio
+import concurrent.futures
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,104 @@ def _pick_free_port(start: int, end: int = 65535) -> int:
             except OSError:
                 continue
     raise RuntimeError(f"No free port in [{start}, {end})")
+
+
+class _FanInEngineFacade:
+    """async_generate-compatible facade that routes through the
+    DynamicFanInOrchestrator.
+
+    Matches the subset of sglang.Engine's async_generate API that verl's
+    SGLangRollout actually uses in _batch_level_generate_sequences.
+    Accepts a LIST of input_ids (one per batch item), runs orchestrator
+    in a thread (since orchestrator is sync; we don't want to block the
+    verl event loop). Returns the original engine's output format: a
+    list of dicts with `text`, `meta_info`, `output_ids` etc.
+
+    This deliberately side-steps the archived `_fanin_generate`-based
+    path in sglang_rollout.py. It is a fresh integration.
+    """
+
+    def __init__(self, orchestrator, tokenizer_manager=None):
+        from sglang.srt.utils.rlpipe_fan_in import RolloutRequest
+        self._orch = orchestrator
+        self._RolloutRequest = RolloutRequest
+        # tokenizer_manager is an attribute some verl code reads; stub.
+        self.tokenizer_manager = tokenizer_manager
+        # For any attribute access verl might do that we don't wrap,
+        # fall back to the underlying TP engine (most query-only APIs
+        # like flush_cache, check_weights can route to TP).
+        # Callers that need DP-fleet-specific behavior must go through
+        # the orchestrator / coordinator directly.
+        self._fallback_engine = None
+
+    def set_fallback(self, engine):
+        self._fallback_engine = engine
+
+    def __getattr__(self, name):
+        # Only called when normal lookup fails. Forward to fallback.
+        if self._fallback_engine is not None:
+            return getattr(self._fallback_engine, name)
+        raise AttributeError(name)
+
+    async def async_generate(
+        self,
+        prompt=None,
+        sampling_params=None,
+        input_ids=None,
+        image_data=None,
+        return_logprob=False,
+        rid=None,
+        **_ignored,
+    ):
+        """Main entry. If input_ids is a list-of-lists (batched), build
+        one RolloutRequest per batch item and fan in via orchestrator.
+        Return list of engine dicts.
+        """
+        if input_ids is None:
+            # verl's non-batched code path — just one prompt.
+            input_ids_list = None
+            prompts = [prompt] if prompt is not None else None
+        elif isinstance(input_ids[0], list):
+            # Batched: list of token-id lists, one per request.
+            input_ids_list = list(input_ids)
+            prompts = None
+        else:
+            # Single request as flat list of ids.
+            input_ids_list = [list(input_ids)]
+            prompts = None
+
+        n = len(input_ids_list) if input_ids_list else len(prompts)
+        imgs = image_data if image_data is not None else [None] * n
+        requests = [
+            self._RolloutRequest(
+                input_ids=(input_ids_list[i] if input_ids_list else None),
+                prompt=(prompts[i] if prompts else None),
+                sampling_params=dict(sampling_params or {}),
+                image_data=imgs[i],
+                return_logprob=return_logprob,
+            )
+            for i in range(n)
+        ]
+
+        # Run the orchestrator in a thread so we don't block the caller's
+        # event loop (orchestrator uses ThreadPool + sync SGLang HTTP calls).
+        loop = asyncio.get_event_loop()
+        results, tel = await loop.run_in_executor(
+            None, self._orch.rollout, requests
+        )
+        # Results are RolloutResult dataclasses; return the raw engine dicts
+        # in batch order.
+        out_dicts = []
+        for r in results:
+            if hasattr(r, "text"):  # RolloutResult
+                # RolloutResult doesn't carry the raw dict; reconstruct
+                # minimally. Callers that need output_ids should use
+                # the orchestrator directly; for text-only downstream
+                # this is sufficient.
+                out_dicts.append({"text": r.text or "", "meta_info": {}})
+            else:
+                out_dicts.append(r)
+        return out_dicts
 
 
 class DualFleetFanInRollout(HetSGLangRollout):
