@@ -1815,6 +1815,22 @@ class RayPPOTrainer:
                         curr_step_profile = next_step_profile
                     if self._trainer_trace is not None:
                         self._trainer_trace.end_step()
+                        # Merge per-rank + trainer JSON into a single
+                        # step{N}_merged.json for Perfetto overview.
+                        try:
+                            from verl.workers.torch_pp.pp_trace import PPTracer
+                            PPTracer.merge_ranks(
+                                save_dir=self._trainer_trace.save_dir,
+                                step=self.global_steps,
+                            )
+                        except Exception as _e:
+                            # Best-effort merge: a broken trace file
+                            # should not fail the step.
+                            import logging as _logging
+                            _logging.getLogger(__name__).warning(
+                                f"[trace merge] step {self.global_steps}: "
+                                f"{type(_e).__name__}: {_e}"
+                            )
 
                     timing_raw["step"] = time.time() - _step_start
                     steps_duration = timing_raw["step"]

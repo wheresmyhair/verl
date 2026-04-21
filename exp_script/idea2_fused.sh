@@ -39,7 +39,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch
 	actor_rollout_ref.actor.param_offload=True \
 	actor_rollout_ref.actor.optimizer_offload=True \
 	actor_rollout_ref.actor.fused_forward=True \
-	actor_rollout_ref.actor.num_micro_batches=$MINI_BATCH \
+	actor_rollout_ref.actor.num_micro_batches=${NUM_MICRO_BATCHES:-$MINI_BATCH} \
 	actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$INFERENCE_BATCH_SIZE \
 	actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
 	actor_rollout_ref.rollout.name=$ENGINE \

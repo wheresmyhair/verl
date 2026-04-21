@@ -351,14 +351,34 @@ class PPTracer:
             json.dump(existing_events + self.events, f)
 
     @staticmethod
-    def merge_ranks(save_dir: str, step: int, pp_size: int) -> str:
-        """Merge per-rank traces into a single file for Perfetto."""
+    def merge_ranks(save_dir: str, step: int, pp_size: int = None) -> str:
+        """Merge per-rank + trainer traces into a single Perfetto-ready file.
+
+        Each rank already uses distinct pid strings (e.g. "0 Phases GPU i",
+        "1 GPU i", "5 HBM GPU i", "6 GPU util GPU i") and the trainer uses
+        "-1 Trainer", so concatenating events preserves the per-rank
+        tracks automatically.
+
+        pp_size is accepted for backward compat but ignored — we now glob
+        for all step{N}_rank*.json files, so the caller doesn't need to
+        know the rank count.
+        """
+        import glob
         all_events = []
-        for rank in range(pp_size):
-            path = os.path.join(save_dir, f"step{step}_rank{rank}.json")
-            if os.path.exists(path):
+        pattern = os.path.join(save_dir, f"step{step}_rank*.json")
+        for path in sorted(glob.glob(pattern)):
+            try:
                 with open(path) as f:
                     all_events.extend(json.load(f))
+            except Exception:
+                pass
+        trainer_path = os.path.join(save_dir, f"step{step}_trainer.json")
+        if os.path.exists(trainer_path):
+            try:
+                with open(trainer_path) as f:
+                    all_events.extend(json.load(f))
+            except Exception:
+                pass
         merged_path = os.path.join(save_dir, f"step{step}_merged.json")
         with open(merged_path, "w") as f:
             json.dump(all_events, f)
