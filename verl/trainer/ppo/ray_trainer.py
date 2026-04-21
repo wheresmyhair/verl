@@ -1584,6 +1584,12 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        # Fan-in orchestrator telemetry (DualFleetFanInRollout).
+                        fanin_metrics = gen_batch_output.meta_info.pop(
+                            "fanin_metrics", None
+                        )
+                        if fanin_metrics:
+                            metrics.update(fanin_metrics)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:

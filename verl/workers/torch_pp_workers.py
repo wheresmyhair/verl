@@ -1060,6 +1060,29 @@ class ActorRolloutRefWorker(Worker):
         if torch.distributed.get_rank() == 0:
             print(f"[PROFILING] generate_sequences timing: {timing_generate}")
 
+        # Fan-in telemetry: when DualFleetFanInRollout ran the orchestrator,
+        # aggregate per-batch telemetry into per-step metrics under the
+        # "fanin/*" namespace. Lives only on TP leader (rank 0 of each TP
+        # group) — other ranks have nothing to contribute, so we stash
+        # only when the rollout instance actually populated it.
+        fanin_records = getattr(self.rollout, "_last_fanin_telemetry", None)
+        if fanin_records and torch.distributed.get_rank() == 0:
+            fanin_metrics = {}
+            n_calls = len(fanin_records)
+            fanin_metrics["fanin/n_calls"] = float(n_calls)
+            # Mean across calls (weighted equally — typically n_calls=1
+            # per generate_sequences anyway).
+            for key in (
+                "n_requests", "n_finished_on_dp", "n_finished_on_tp",
+                "swap_triggered", "total_wall_s",
+                "t_first_dp_done_s", "t_last_dp_done_s",
+                "t_swap_decision_s", "t_swap_done_s", "t_tail_phase_done_s",
+            ):
+                vals = [r[key] for r in fanin_records if r.get(key) is not None]
+                if vals:
+                    fanin_metrics[f"fanin/{key}_mean"] = float(sum(vals)) / len(vals)
+            output.meta_info["fanin_metrics"] = fanin_metrics
+
         # ── Response length profiling ──
         # NOTE: Don't put per-worker metrics into output.meta_info — DP workers
         # see different samples, causing conflicts in DataProto.concat().

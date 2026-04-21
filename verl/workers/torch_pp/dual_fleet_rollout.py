@@ -69,7 +69,7 @@ class _FanInEngineFacade:
     path in sglang_rollout.py. It is a fresh integration.
     """
 
-    def __init__(self, orchestrator, tokenizer_manager=None):
+    def __init__(self, orchestrator, tokenizer_manager=None, rollout_ref=None):
         from sglang.srt.utils.rlpipe_fan_in import RolloutRequest
         self._orch = orchestrator
         self._RolloutRequest = RolloutRequest
@@ -81,6 +81,10 @@ class _FanInEngineFacade:
         # Callers that need DP-fleet-specific behavior must go through
         # the orchestrator / coordinator directly.
         self._fallback_engine = None
+        # Optional: DualFleetFanInRollout instance to stash telemetry
+        # on after each rollout call, so the worker/trainer can promote
+        # orchestrator metrics into the step's metrics dict.
+        self._rollout_ref = rollout_ref
 
     def set_fallback(self, engine):
         self._fallback_engine = engine
@@ -153,6 +157,24 @@ class _FanInEngineFacade:
             f"dp={tel.n_finished_on_dp} tp={tel.n_finished_on_tp} "
             f"wall={tel.total_wall_s:.3f}s"
         )
+        # Stash telemetry on the rollout so the worker can surface it
+        # into per-step metrics. Accumulate across multiple generate calls
+        # per step (validation vs train).
+        if self._rollout_ref is not None:
+            prev = getattr(self._rollout_ref, "_last_fanin_telemetry", None) or []
+            prev.append({
+                "n_requests": tel.n_requests,
+                "n_finished_on_dp": tel.n_finished_on_dp,
+                "n_finished_on_tp": tel.n_finished_on_tp,
+                "swap_triggered": 1 if tel.swap_triggered else 0,
+                "total_wall_s": tel.total_wall_s,
+                "t_first_dp_done_s": tel.t_first_dp_done_s,
+                "t_last_dp_done_s": tel.t_last_dp_done_s,
+                "t_swap_decision_s": tel.t_swap_decision_s,
+                "t_swap_done_s": tel.t_swap_done_s,
+                "t_tail_phase_done_s": tel.t_tail_phase_done_s,
+            })
+            self._rollout_ref._last_fanin_telemetry = prev
         return out_dicts
 
 
@@ -437,9 +459,11 @@ class DualFleetFanInRollout(HetSGLangRollout):
         self._fanin_coord._release_fleet("tp")
 
         saved_engine = self._engine
-        facade = _FanInEngineFacade(self._fanin_orch)
+        facade = _FanInEngineFacade(self._fanin_orch, rollout_ref=self)
         facade.set_fallback(saved_engine)
         self._engine = facade
+        # Reset the telemetry buffer at the start of each generate call.
+        self._last_fanin_telemetry = []
         try:
             return super()._batch_level_generate_sequences(prompts, **kwargs)
         finally:
