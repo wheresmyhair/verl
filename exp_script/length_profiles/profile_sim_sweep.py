@@ -19,7 +19,15 @@ from dp_bubble_sweep import simulate_dp
 
 
 PROFILES_ROOT = Path("/home/user/data/length-profiles")
-PROFILE_NAMES = [
+# Auto-discover all profile dirs under PROFILES_ROOT; fall back to
+# canonical 6 if discovery fails.
+def _discover():
+    out = []
+    for d in sorted(PROFILES_ROOT.iterdir()):
+        if d.is_dir() and (d / "prompts_lengths.json").exists():
+            out.append(d.name)
+    return out
+PROFILE_NAMES = _discover() or [
     "P1_tight_short", "P2_tight_mid", "P3_wide_mid",
     "P4_tight_long", "P5_bimodal", "P6_saturated",
 ]
