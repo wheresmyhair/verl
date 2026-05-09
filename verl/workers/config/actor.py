@@ -204,6 +204,12 @@ class McoreActorConfig(ActorConfig):
     load_weight: bool = True
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)
+    # Fused forward: interleave inference iF into training PP bubbles so
+    # compute_log_prob piggybacks on update_actor's PP schedule. Uses
+    # gloo pair-groups for fused-phase P2P (NCCL P2P deadlocks on the
+    # required asymmetric pre-post; see project_megatron_two_pp_deadlock_tbd).
+    # Requires `fused_p2p` pair groups created at init.
+    fused_forward: bool = False
 
 
 @dataclass
