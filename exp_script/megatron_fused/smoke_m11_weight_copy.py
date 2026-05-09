@@ -8,7 +8,15 @@ actor data on rank (P-1-r) bit-exactly.
 This is a fast self-contained smoke (no verl trainer / sglang). Builds the
 two models from a tiny synthetic config to keep memory / time low.
 
-Run:
+FIXME(2026-05-09): standalone construction needs more plumbing (pg_collection
+explicit, layer_spec compatible with our config, FakeHF needs more attrs).
+For now the AUTHORITATIVE validation is the e2e run via
+`exp_script/megatron_fused/idea2_megatron_baseline.sh
+ actor_rollout_ref.actor.fused_forward=True` which exercises the helper at
+PP=4 0.6B once per train step (fused_update_actor reaches step:1 with
+mem 7.4 GB rank 0).
+
+Run (currently fails — known limitation):
   torchrun --nproc-per-node=4 \
     /home/user/rlpipe/verl/exp_script/megatron_fused/smoke_m11_weight_copy.py
 """
@@ -66,7 +74,8 @@ def main():
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=pp_size,
         sequence_parallel=False,
-        variable_seq_lengths=True,
+        variable_seq_lengths=False,
+        moe_token_dispatcher_type='alltoall',
     )
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     layer_spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True)
