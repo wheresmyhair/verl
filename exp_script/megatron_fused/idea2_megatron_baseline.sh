@@ -64,6 +64,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
+    actor_rollout_ref.rollout.weight_sync_mode=${WEIGHT_SYNC_MODE:-tensor} \
     actor_rollout_ref.rollout.n=$N_SAMPLES \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \

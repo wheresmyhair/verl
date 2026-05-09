@@ -73,7 +73,11 @@ class DistributedWeightSyncCoordinator:
     master_addr: str = "127.0.0.1"
     master_port: int = 29600
     group_name: str = "rlpipe_weight_update"
-    backend: str = "nccl"
+    # Backend: "nccl" requires distinct GPUs per rank in the group.
+    # In hybrid mode actor + sglang scheduler share the SAME GPU per
+    # DP replica → NCCL fails with "Duplicate GPU detected". Use "gloo"
+    # which CPU-stages tensors (one D2H + one H2D per broadcast).
+    backend: str = "gloo"
 
     # Filled at init_actor_side
     _update_pg: Optional[dist.ProcessGroup] = field(default=None, init=False)
@@ -141,13 +145,20 @@ class DistributedWeightSyncCoordinator:
     def broadcast(self, tensor: torch.Tensor) -> None:
         """Actor rank 0 sends `tensor` to all sglang TP ranks via the update group.
 
-        Sglang side has matching `dist.broadcast(empty, src=0, group=...)` issued
-        from `update_weights_from_distributed`. This call returns when NCCL
-        completes the send (the actual data movement is on a NCCL stream).
+        For gloo backend (default; required when actor+sglang share GPU
+        in hybrid mode), tensor is CPU-staged before broadcast. Sglang side
+        receives via empty CPU buffer + dist.broadcast then moves to GPU.
+
+        For nccl backend (requires distinct GPUs per rank), tensor stays on GPU.
         """
         if not self._initialized:
             raise RuntimeError("init_actor_side() must be called first")
-        dist.broadcast(tensor, src=0, group=self._update_pg, async_op=False)
+        if self.backend == "gloo":
+            # Stage to CPU; gloo's send is truly async w.r.t. receiver.
+            send_buf = tensor.detach().contiguous().cpu()
+            dist.broadcast(send_buf, src=0, group=self._update_pg, async_op=False)
+        else:
+            dist.broadcast(tensor, src=0, group=self._update_pg, async_op=False)
 
     def destroy(self) -> None:
         if self._update_pg is not None:

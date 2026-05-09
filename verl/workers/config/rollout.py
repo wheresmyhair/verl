@@ -156,6 +156,17 @@ class RolloutConfig(BaseConfig):
 
     update_weights_bucket_megabytes: int = 512
 
+    # Weight sync mode between training engine and inference engine.
+    # - "tensor": stock CUDA-IPC path (verl default; needs container CAP_SYS_PTRACE)
+    # - "distributed": NCCL collective broadcast over a TCPStore-rendezvous group
+    #   (rlpipe extension for ptrace-restricted docker — see
+    #   docs/rlpipe/option_b_distributed_weight_sync_plan.md)
+    weight_sync_mode: str = "tensor"
+    # Master address/port for the distributed weight-sync TCPStore. Both
+    # actor and sglang sides must agree. Only used when weight_sync_mode="distributed".
+    weight_sync_master_addr: str = "127.0.0.1"
+    weight_sync_master_port: int = 29600
+
     skip_rollout: bool = False
 
     skip_dump_dir: str = "/tmp/rollout_dump"

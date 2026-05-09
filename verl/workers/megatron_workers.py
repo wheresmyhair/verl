@@ -557,6 +557,53 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         get_torch_device().empty_cache()
         log_gpu_memory_usage("After init_model finish", logger=logger)
 
+    async def _ensure_distributed_weight_sync_inited(self):
+        """Lazy init of distributed weight-sync NCCL group (Option B).
+
+        Both actor and sglang sides rendezvous at TCPStore master_addr:port.
+        Idempotent — only runs once per worker. Returns the coord object
+        (or None if mode is not "distributed").
+        """
+        if getattr(self.config.rollout, "weight_sync_mode", "tensor") != "distributed":
+            return None
+        if getattr(self, "_dist_weight_sync_coord", None) is not None:
+            return self._dist_weight_sync_coord
+
+        from verl.utils.megatron.distributed_weight_sync import DistributedWeightSyncCoordinator
+        sglang_tp_size = self.config.rollout.tensor_model_parallel_size
+        # Per-DP-replica TCPStore: each DP group has its own (actor, sglang)
+        # pair and needs a unique port to avoid EADDRINUSE collisions.
+        from megatron.core import parallel_state as mpu
+        try:
+            dp_rank = mpu.get_data_parallel_rank()
+        except Exception:
+            dp_rank = 0
+        base_port = self.config.rollout.weight_sync_master_port
+        coord = DistributedWeightSyncCoordinator(
+            sglang_tp_size=sglang_tp_size,
+            master_addr=self.config.rollout.weight_sync_master_addr,
+            master_port=base_port + dp_rank,  # offset per DP replica
+            group_name=f"rlpipe_weight_update_dp{dp_rank}",
+        )
+
+        # Both sides must reach init concurrently or TCPStore rendezvous hangs.
+        # Sglang side (init via tokenizer_manager RPC); only TP rank 0 in
+        # rollout_device_mesh dispatches. Actor side: only PP rank 0 joins.
+        import asyncio
+        sglang_init_task = asyncio.create_task(self.rollout.init_weights_update_group(coord))
+
+        from megatron.core import parallel_state as mpu
+        actor_pp_rank = mpu.get_pipeline_model_parallel_rank()
+        if actor_pp_rank == 0:
+            # Run blocking init in a thread so we don't block the asyncio loop
+            # while sglang side proceeds.
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, coord.init_actor_side)
+
+        await sglang_init_task
+        self._dist_weight_sync_coord = coord
+        return coord
+
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
@@ -580,7 +627,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
-        await self.rollout.update_weights(per_tensor_param)
+
+        # rlpipe Option B: NCCL collective replaces CUDA IPC when configured.
+        # See docs/rlpipe/option_b_distributed_weight_sync_plan.md
+        weight_sync_mode = getattr(self.config.rollout, "weight_sync_mode", "tensor")
+        if weight_sync_mode == "distributed":
+            coord = await self._ensure_distributed_weight_sync_inited()
+            from megatron.core import parallel_state as mpu
+            actor_pp_rank = mpu.get_pipeline_model_parallel_rank()
+            await self.rollout.update_weights_distributed(
+                per_tensor_param, coord=coord, actor_pp_rank=actor_pp_rank,
+            )
+        else:
+            await self.rollout.update_weights(per_tensor_param)
+
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)

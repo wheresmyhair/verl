@@ -2159,6 +2159,100 @@ class SGLangRollout(BaseRollout):
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
 
+    async def init_weights_update_group(self, coord) -> None:
+        """Initialize the NCCL collective group for distributed weight sync.
+
+        Forwards to sglang's tokenizer_manager → scheduler → tp_workers,
+        each of which calls `init_custom_process_group(rank=1+local_rank,
+        world_size=1+sglang_tp_size)`. Must be called CONCURRENTLY with
+        the actor side's `coord.init_actor_side()`; both sides rendezvous
+        at TCPStore master_addr:master_port.
+
+        Args:
+            coord: a `DistributedWeightSyncCoordinator` with master_addr,
+                master_port, group_name configured.
+        """
+        # Only TP rank 0 issues the RPC; the dispatcher fans out internally
+        if self.device_mesh["infer_tp"].get_local_rank() != 0:
+            return
+        from sglang.srt.managers.io_struct import InitWeightsUpdateGroupReqInput
+        obj = InitWeightsUpdateGroupReqInput(
+            master_address=coord.master_addr,
+            master_port=coord.master_port,
+            rank_offset=1,
+            world_size=coord.world_size,
+            group_name=coord.group_name,
+            backend=coord.backend,
+        )
+        result = await self._engine.tokenizer_manager.init_weights_update_group(obj, None)
+        ok = result[0] if isinstance(result, tuple) else getattr(result, "success", True)
+        if not ok:
+            msg = result[1] if isinstance(result, tuple) else getattr(result, "message", "unknown")
+            raise RuntimeError(f"sglang init_weights_update_group failed: {msg}")
+
+    async def update_weights_distributed(
+        self, weights, coord, actor_pp_rank: int = 0, **kwargs,
+    ):
+        """NCCL-collective weight update, bypassing CUDA IPC.
+
+        Use when `weight_sync_mode == "distributed"` (e.g. docker without
+        CAP_SYS_PTRACE; see `verl/utils/megatron/distributed_weight_sync.py`).
+
+        Flow:
+          1. Materialize per_tensor_param into parallel name/dtype/shape/tensor lists
+          2. Dispatch update_weights_from_distributed RPC to sglang scheduler
+             — internally posts dist.broadcast(buf, src=0) for each tensor
+          3. Concurrently, actor PP rank 0 calls coord.broadcast(tensor) per tensor
+             matching sglang's broadcasts in order via the shared NCCL group
+
+        Args:
+            weights: Generator yielding (name, tensor). On non-PP-rank-0
+                ranks, may be the same generator (already gathered) but
+                we skip the broadcasts there.
+            coord: DistributedWeightSyncCoordinator (init'd via init_actor_side
+                on rank 0 + init_weights_update_group on this side)
+            actor_pp_rank: actor's PP rank in megatron (only rank 0 sends)
+        """
+        import asyncio
+        from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqInput
+
+        # Materialize: needed because sglang's RPC takes meta upfront,
+        # but we need the actual tensors for the matching broadcasts.
+        weights_list = list(weights)
+        names = [n for n, _ in weights_list]
+        dtypes = [str(t.dtype).removeprefix("torch.") for _, t in weights_list]
+        shapes = [list(t.shape) for _, t in weights_list]
+        tensors = [t for _, t in weights_list]
+
+        rpc_task = None
+        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            obj = UpdateWeightsFromDistributedReqInput(
+                names=names, dtypes=dtypes, shapes=shapes,
+                group_name=coord.group_name, flush_cache=True,
+            )
+            # Schedule the sglang side to post broadcasts. sglang scheduler
+            # subprocess will iterate and post dist.broadcast(empty, src=0)
+            # for each tensor in order. We MUST issue our matching
+            # broadcasts in the same order at roughly the same time for
+            # NCCL to match.
+            rpc_task = asyncio.create_task(
+                self._engine.tokenizer_manager.update_weights_from_distributed(obj, None)
+            )
+
+        # Issue actor-side broadcasts (only PP rank 0 sends)
+        if actor_pp_rank == 0:
+            # Yield to give the RPC a chance to dispatch + sglang scheduler
+            # to start its broadcast loop. Without this the actor might
+            # post its broadcast before sglang has posted its recv.
+            await asyncio.sleep(0)
+            for tensor in tensors:
+                # Synchronous NCCL broadcast — blocks this coroutine until
+                # the matching sglang recv arrives.
+                coord.broadcast(tensor)
+
+        if rpc_task is not None:
+            await rpc_task
+
 
 class ServerAdapter(BaseRollout):
     """SGLang server adapter used in native http server mode, serve as http client to request SGLang server

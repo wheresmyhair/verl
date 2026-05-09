@@ -246,6 +246,14 @@ agent:
 # when using Tensor Parallelism (TP) >= 8.
 update_weights_bucket_megabytes: 512
 
+# rlpipe Option B: weight sync mode between training engine and inference engine.
+# - "tensor": stock CUDA-IPC path (verl default; needs container CAP_SYS_PTRACE)
+# - "distributed": NCCL collective broadcast over TCPStore-rendezvous group
+#   (rlpipe extension for ptrace-restricted docker)
+weight_sync_mode: tensor
+weight_sync_master_addr: 127.0.0.1
+weight_sync_master_port: 29600
+
 # trace rollout data
 trace:
 
