@@ -764,6 +764,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         `forward_backward_fused_pipelining`) lands in M-B Step 5; the
         contract (output: old_log_probs + metrics) and trainer wiring stay
         the same.
+
+        Even in V1 we already copy actor → reverse-PP infer weights here so
+        the helper is exercised once per train step. Step 5 then replaces
+        the back-to-back compute with an interleaved schedule that consumes
+        infer_module.
         """
         assert self._is_actor
         if self._is_offload_param:
@@ -771,6 +776,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After load actor params during fused_update_actor", logger=logger)
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
+
+        # Weight copy actor → reverse-PP infer (M-B Step 4)
+        if self.infer_module is not None:
+            from megatron.core import parallel_state as mpu
+            from verl.utils.megatron.reverse_pp_model import copy_actor_to_reverse_infer
+            from verl.utils.megatron_utils import unwrap_model
+
+            actor_gpt = unwrap_model(self.actor_module[0])
+            copy_actor_to_reverse_infer(
+                actor_gpt_model=actor_gpt,
+                infer_gpt_model=self.infer_module,
+                actor_pp_group=mpu.get_pipeline_model_parallel_group(),
+            )
+            log_gpu_memory_usage("After copy_actor_to_reverse_infer", logger=logger)
 
         # 1) old_log_probs (will be replaced by iF interleaved into tF/tB)
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu

@@ -217,3 +217,50 @@ def build_reverse_pp_inference_model(
         )
 
     return gpt_model
+
+
+def copy_actor_to_reverse_infer(actor_gpt_model, infer_gpt_model, actor_pp_group):
+    """Replicate actor weights into the reverse-PP infer model.
+
+    Pairing: actor at world rank r holds layers/heads identical in shape to
+    infer at world rank P-1-r. We `all_gather_object` the per-rank actor
+    state_dict (CPU tensors), then each rank loads slot [P-1-r] into its
+    local infer module.
+
+    Memory: each rank temporarily holds P × actor-shard-state on CPU. For
+    Qwen3-8B PP=4 that's ~16 GB host RAM, well within budget.
+    """
+    pp_size = dist.get_world_size(group=actor_pp_group)
+    pp_rank = dist.get_rank(group=actor_pp_group)
+
+    # Move local state to CPU before pickling so we don't gather GPU tensors
+    # over gloo (the global all_gather_object backend). Megatron's GPTModel
+    # state_dict places None for slots that don't apply on this stage
+    # (e.g. shared embedding weight on middle ranks); skip them.
+    local_state = {
+        k: v.detach().cpu()
+        for k, v in actor_gpt_model.state_dict().items()
+        if v is not None
+    }
+
+    gathered = [None] * pp_size
+    dist.all_gather_object(gathered, local_state, group=actor_pp_group)
+
+    peer_state = gathered[pp_size - 1 - pp_rank]
+    if peer_state is None:
+        raise RuntimeError(
+            f"all_gather_object returned None for peer rank {pp_size - 1 - pp_rank}; "
+            "check actor_pp_group membership."
+        )
+
+    # Move to the device the infer model is on, then load.
+    target_device = next(infer_gpt_model.parameters()).device
+    peer_state_on_device = {k: v.to(target_device, non_blocking=True) for k, v in peer_state.items()}
+    missing, unexpected = infer_gpt_model.load_state_dict(peer_state_on_device, strict=False)
+    if missing or unexpected:
+        logger.warning(
+            "[copy_actor_to_reverse_infer] missing=%d unexpected=%d (rank=%d). "
+            "Sample missing=%s; sample unexpected=%s",
+            len(missing), len(unexpected), dist.get_rank(),
+            list(missing)[:5], list(unexpected)[:5],
+        )
