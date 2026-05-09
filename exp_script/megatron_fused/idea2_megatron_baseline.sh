@@ -15,14 +15,16 @@ MODEL_PATH="${MODEL_PATH:-/home/user/.cache/huggingface/hub/models--Qwen--Qwen3-
 
 source "$(dirname "$0")/../common.sh"
 
-# Override common.sh defaults for SMALL smoke
-BATCH=4
-N_SAMPLES=2
-MAX_RESP=512
-MAX_PROMPT=1024
-MINI_BATCH=4
-INFERENCE_BATCH_SIZE=1
-TOTAL_STEPS=1
+# Default to SMALL smoke (Qwen3-0.6B, BATCH=4, 1 step). Override via env
+# for production-scale testing (e.g. BATCH=128 N_SAMPLES=8 MAX_RESP=16384
+# MAX_PROMPT=2048 MINI_BATCH=128 with Qwen3-8B for paper-grade run).
+BATCH=${BATCH:-4}
+N_SAMPLES=${N_SAMPLES:-2}
+MAX_RESP=${MAX_RESP:-512}
+MAX_PROMPT=${MAX_PROMPT:-1024}
+MINI_BATCH=${MINI_BATCH:-${BATCH}}
+INFERENCE_BATCH_SIZE=${INFERENCE_BATCH_SIZE:-1}
+TOTAL_STEPS=${TOTAL_STEPS:-1}
 
 EXP_NAME=idea2_megatron_baseline
 PROFILING_DIR=$PROFILING_ROOT/$EXP_NAME/seed_${SEED}
