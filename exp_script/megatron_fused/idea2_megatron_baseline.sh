@@ -32,8 +32,9 @@ mkdir -p "$PROFILING_DIR"
 ENGINE=sglang
 ROLLOUT_TP=1
 GPU_MEMORY_UTILIZATION=0.55
-PP_SIZE=2
-TP_SIZE=1
+PP_SIZE=${PP_SIZE:-2}
+TP_SIZE=${TP_SIZE:-1}
+GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 
 python3 -m verl.trainer.main_ppo \
     --config-path=/home/user/rlpipe/verl/verl/trainer/config \
