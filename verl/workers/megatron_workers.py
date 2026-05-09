@@ -554,6 +554,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 bridge=self.bridge,
                 use_dist_checkpointing=self.config.actor.megatron.use_dist_checkpointing,
             )
+        # rlpipe F2 idea2: fused-forward gloo pair groups will be created
+        # lazily on first fused_update_policy call (also collective; deferring
+        # to that call site keeps init_model unchanged for non-fused configs
+        # and avoids the cross-worker-type collective coordination problem
+        # that an unconditional init here would create).
+        self._fused_pair_groups = None
+
         get_torch_device().empty_cache()
         log_gpu_memory_usage("After init_model finish", logger=logger)
 
