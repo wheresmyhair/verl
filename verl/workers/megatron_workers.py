@@ -571,35 +571,29 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         from verl.utils.megatron.distributed_weight_sync import DistributedWeightSyncCoordinator
         sglang_tp_size = self.config.rollout.tensor_model_parallel_size
-        # Per-DP-replica TCPStore: each DP group has its own (actor, sglang)
-        # pair and needs a unique port to avoid EADDRINUSE collisions.
+        # Per-WORKER TCPStore: in hybrid mode each ray worker has its own
+        # actor + colocated sglang scheduler subprocess. They form a
+        # 2-member NCCL group privately, no cross-worker coordination
+        # needed. Port = base + world_rank, group name uniqued by world_rank
+        # to avoid any collisions.
         from megatron.core import parallel_state as mpu
-        try:
-            dp_rank = mpu.get_data_parallel_rank()
-        except Exception:
-            dp_rank = 0
+        world_rank = torch.distributed.get_rank()
         base_port = self.config.rollout.weight_sync_master_port
         coord = DistributedWeightSyncCoordinator(
             sglang_tp_size=sglang_tp_size,
             master_addr=self.config.rollout.weight_sync_master_addr,
-            master_port=base_port + dp_rank,  # offset per DP replica
-            group_name=f"rlpipe_weight_update_dp{dp_rank}",
+            master_port=base_port + world_rank,
+            group_name=f"rlpipe_weight_update_w{world_rank}",
         )
 
-        # Both sides must reach init concurrently or TCPStore rendezvous hangs.
-        # Sglang side (init via tokenizer_manager RPC); only TP rank 0 in
-        # rollout_device_mesh dispatches. Actor side: only PP rank 0 joins.
+        # Per-worker group: actor side is THIS worker's verl process,
+        # sglang side is THIS worker's sglang scheduler subprocess.
+        # No cross-worker coordination — every worker initializes its
+        # own pair group independently.
         import asyncio
         sglang_init_task = asyncio.create_task(self.rollout.init_weights_update_group(coord))
-
-        from megatron.core import parallel_state as mpu
-        actor_pp_rank = mpu.get_pipeline_model_parallel_rank()
-        if actor_pp_rank == 0:
-            # Run blocking init in a thread so we don't block the asyncio loop
-            # while sglang side proceeds.
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, coord.init_actor_side)
-
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, coord.init_actor_side)
         await sglang_init_task
         self._dist_weight_sync_coord = coord
         return coord
@@ -633,10 +627,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         weight_sync_mode = getattr(self.config.rollout, "weight_sync_mode", "tensor")
         if weight_sync_mode == "distributed":
             coord = await self._ensure_distributed_weight_sync_inited()
-            from megatron.core import parallel_state as mpu
-            actor_pp_rank = mpu.get_pipeline_model_parallel_rank()
+            # Per-worker group: every actor is "rank 0" in its own group and
+            # broadcasts to its colocated sglang. PP-shard gather already
+            # done by per_tensor_generator (every rank sees full tensors).
             await self.rollout.update_weights_distributed(
-                per_tensor_param, coord=coord, actor_pp_rank=actor_pp_rank,
+                per_tensor_param, coord=coord, actor_pp_rank=0,
             )
         else:
             await self.rollout.update_weights(per_tensor_param)
