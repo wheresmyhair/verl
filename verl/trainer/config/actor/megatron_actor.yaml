@@ -18,3 +18,8 @@ strategy: megatron
 data_loader_seed: null
 
 load_weight: True
+
+# rlpipe F2 idea2: enable fused-forward (interleave inference iF into
+# update_actor's training PP schedule). Builds a reverse-PP inference
+# model alongside the training actor at init_model. Default off.
+fused_forward: False

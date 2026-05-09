@@ -1591,6 +1591,31 @@ class RayPPOTrainer:
                         if fanin_metrics:
                             metrics.update(fanin_metrics)
 
+                    # ── rollout-only mode: write timing/metrics + exit
+                    # before ref_log_prob/old_log_prob/update_actor.
+                    # Used by length-profile grid runner (BATCH≫16 fits
+                    # rollout but not training).
+                    if os.environ.get("VERL_ROLLOUT_ONLY") == "1":
+                        import sys
+                        out = {
+                            "step": self.global_steps,
+                            "timing": dict(timing_raw),
+                            "fanin_metrics": fanin_metrics or {},
+                            "response_lengths": [
+                                float(x) for x in gen_batch_output.non_tensor_batch.get(
+                                    "response_lengths", []
+                                )
+                            ],
+                        }
+                        out_path = os.environ.get("VERL_ROLLOUT_ONLY_OUT")
+                        if out_path:
+                            with open(out_path, "w") as f:
+                                json.dump(out, f, indent=2)
+                            print(f"[rollout-only] wrote {out_path}", flush=True)
+                        gen_t = timing_raw.get("gen", 0.0)
+                        print(f"[rollout-only] T^gen={gen_t:.2f}s; n_resp={len(out['response_lengths'])}; exit", flush=True)
+                        sys.exit(0)
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")

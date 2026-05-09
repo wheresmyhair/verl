@@ -96,21 +96,25 @@ def _reverse_pp_rank_context(pp_size: int, actor_pp_rank: int):
     (pp_size - 1 - actor_pp_rank). Used during inference-model
     construction to flip layer-offset/pre_process/post_process.
 
-    Patches:
+    Patches (all modules that did `from megatron.core.utils import get_pg_rank`
+    have their own bound name, so we have to patch each binding):
       - megatron.core.parallel_state.get_pipeline_model_parallel_rank
-      - megatron.core.utils.get_pg_rank
+      - megatron.core.utils.get_pg_rank (canonical)
       - megatron.core.transformer.transformer_block.get_pg_rank
-        (re-imported binding inside the module)
+      - megatron.core.pipeline_parallel.utils.get_pg_rank
+        (used by language_module's is_pp_first_stage / is_pp_last_stage)
     """
     import megatron.core.parallel_state as ps
     import megatron.core.utils as mcu
     import megatron.core.transformer.transformer_block as tb
+    import megatron.core.pipeline_parallel.utils as ppu
 
     reversed_rank = pp_size - 1 - actor_pp_rank
 
     orig_ps_get_rank = ps.get_pipeline_model_parallel_rank
     orig_mcu_get_pg_rank = mcu.get_pg_rank
     orig_tb_get_pg_rank = tb.get_pg_rank
+    orig_ppu_get_pg_rank = ppu.get_pg_rank
 
     def patched_ps_get_rank():
         return reversed_rank
@@ -137,12 +141,14 @@ def _reverse_pp_rank_context(pp_size: int, actor_pp_rank: int):
     ps.get_pipeline_model_parallel_rank = patched_ps_get_rank
     mcu.get_pg_rank = patched_get_pg_rank
     tb.get_pg_rank = patched_get_pg_rank
+    ppu.get_pg_rank = patched_get_pg_rank
     try:
         yield reversed_rank
     finally:
         ps.get_pipeline_model_parallel_rank = orig_ps_get_rank
         mcu.get_pg_rank = orig_mcu_get_pg_rank
         tb.get_pg_rank = orig_tb_get_pg_rank
+        ppu.get_pg_rank = orig_ppu_get_pg_rank
 
 
 def build_reverse_pp_inference_model(
@@ -163,24 +169,18 @@ def build_reverse_pp_inference_model(
     """
     from megatron.core.models.gpt.gpt_model import GPTModel
 
-    # 1. Same pg_collection as actor (we don't try to literally reverse the
-    # process group — pytorch sorts ranks during new_group).
-    rev_collection = build_reverse_pp_pg_collection(actor_pg_collection)
-
-    # 2. Determine pre_process / post_process from REVERSED in-group rank.
-    # The construction code (under our monkey-patch context) will see
-    # the reversed rank, so embedding/lm_head/layer-offset all flip.
-    actor_pp_rank = dist.get_rank(group=rev_collection.pp)
-    pp_size = dist.get_world_size(group=rev_collection.pp)
+    # 1. Reuse actor's pg_collection (= mpu default). Reversal is via
+    # monkey-patch context, not via a different process group.
+    actor_pp_rank = dist.get_rank(group=actor_pg_collection.pp)
+    pp_size = dist.get_world_size(group=actor_pg_collection.pp)
     rev_pp_rank = pp_size - 1 - actor_pp_rank
     pre_process = (rev_pp_rank == 0)           # embedding lives at rev rank 0 (= train rank P-1)
     post_process = (rev_pp_rank == pp_size - 1)  # lm_head lives at rev rank P-1 (= train rank 0)
 
-    if dist.get_rank() == 0:
-        logger.info(
-            "[reverse-PP infer] world ranks in rev_pp_group: %s; this rank rev_pp=%d, pre=%s, post=%s",
-            dist.get_process_group_ranks(rev_collection.pp), rev_pp_rank, pre_process, post_process,
-        )
+    logger.info(
+        "[reverse-PP infer] world rank %d: actor_pp=%d → rev_pp=%d, pre=%s, post=%s",
+        dist.get_rank(), actor_pp_rank, rev_pp_rank, pre_process, post_process,
+    )
 
     # 3. Use verl's existing model initializer to get the right
     # transformer_layer_spec (handles Qwen2/3 dense + MoE etc.),
@@ -197,7 +197,10 @@ def build_reverse_pp_inference_model(
     rotary_base = getattr(actor_hf_config, "rope_theta", 10000)
 
     # Build under monkey-patch so layer offsets / pre_process / post_process
-    # are computed for the REVERSED pp_rank.
+    # are computed for the REVERSED pp_rank. We do NOT pass pg_collection —
+    # GPTModel falls back to mpu.use_mpu_process_groups() which gives the
+    # actor's pp_group; under monkey-patch, get_pg_rank() on that group
+    # returns the reversed rank during init.
     with _reverse_pp_rank_context(pp_size, actor_pp_rank):
         gpt_model = GPTModel(
             config=actor_tf_config,
@@ -210,8 +213,7 @@ def build_reverse_pp_inference_model(
             position_embedding_type="rope",
             rotary_base=rotary_base,
             parallel_output=parallel_output,
-            pg_collection=rev_collection,
             **rope_scaling_args,
         )
 
-    return gpt_model, rev_collection
+    return gpt_model

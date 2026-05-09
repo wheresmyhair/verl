@@ -340,6 +340,41 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.rank == 0:
                 print_model_size(actor_module[0])
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
+
+            # rlpipe F2 idea2: build reverse-PP inference model alongside actor.
+            # Used by fused_update_policy to run iF in PP bubbles flowing
+            # rank P-1 → 0. Layer offsets / embedding / lm_head positions
+            # are flipped relative to the actor via monkey-patch context.
+            self.infer_module = None
+            if getattr(self.config.actor, "fused_forward", False):
+                from megatron.core import parallel_state as mpu
+                from megatron.core.process_groups_config import ProcessGroupCollection
+                from verl.utils.megatron.reverse_pp_model import build_reverse_pp_inference_model
+
+                actor_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+                pp_size = mpu.get_pipeline_model_parallel_world_size()
+                if pp_size > 1:
+                    self.infer_module = build_reverse_pp_inference_model(
+                        actor_tf_config=self.tf_config,
+                        actor_hf_config=self.hf_config,
+                        actor_pg_collection=actor_pg_collection,
+                        share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+                        parallel_output=True,
+                    )
+                    self.infer_module = self.infer_module.to(torch.cuda.current_device())
+                    if self.rank == 0:
+                        n_params = sum(p.numel() for p in self.infer_module.parameters())
+                        logger.info(
+                            "[fused_forward] reverse-PP infer module built: %d params on this rank",
+                            n_params,
+                        )
+                    log_gpu_memory_usage("After reverse-PP infer module init", logger=logger)
+                else:
+                    if self.rank == 0:
+                        logger.info(
+                            "[fused_forward] PP=1; skipping reverse-PP infer module build "
+                            "(no benefit at PP=1)"
+                        )
         elif self._is_ref:
             wrap_config = McoreModuleWrapperConfig(
                 is_value_model=False,  # ref is not value model
@@ -715,6 +750,66 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        aggressive_empty_cache(force_sync=True)
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @GPUMemoryLogger(role="fused_update_actor", logger=logger)
+    @DistProfiler.annotate(color="red")
+    def fused_update_actor(self, data: DataProto):
+        """rlpipe F2 idea2 entrypoint.
+
+        Stub V1: runs compute_log_prob then update_policy back-to-back. Real
+        fusion (interleaving iF into the training PP schedule using
+        `forward_backward_fused_pipelining`) lands in M-B Step 5; the
+        contract (output: old_log_probs + metrics) and trainer wiring stay
+        the same.
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.actor_module)
+            log_gpu_memory_usage("After load actor params during fused_update_actor", logger=logger)
+        if self._is_offload_optimizer:
+            load_megatron_optimizer(self.actor_optimizer)
+
+        # 1) old_log_probs (will be replaced by iF interleaved into tF/tB)
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        old_log_probs, _ = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+
+        # attach to data so update_policy sees it
+        data.batch["old_log_probs"] = old_log_probs.to(data.batch["responses"].device)
+
+        # 2) update_policy
+        micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        dataloader = self.actor.make_minibatch_iterator(data=data)
+        with Timer(name="fused_update_policy", logger=None) as timer:
+            metrics = self.actor.update_policy(dataloader=dataloader)
+        delta_time = timer.last
+        global_num_tokens = data.meta_info["global_token_num"]
+        estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+        metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+        metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+        metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+        metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+        from verl.utils.megatron.optimizer import get_megatron_last_lr
+
+        metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
+        self.actor_optimizer_scheduler.step(1)
+
+        output = DataProto.from_dict(
+            tensors={"old_log_probs": old_log_probs},
+            meta_info={"metrics": metrics, "temperature": self.config.rollout.temperature},
+        )
+        output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.actor_module)
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.actor_optimizer)
         aggressive_empty_cache(force_sync=True)
         return output
 

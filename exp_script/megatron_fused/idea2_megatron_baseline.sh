@@ -90,4 +90,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=9999 \
     trainer.val_before_train=False \
     trainer.total_training_steps=$TOTAL_STEPS \
-    trainer.total_epochs=1 2>&1 | stdbuf -oL sed 's/\x1b\[[0-9;]*m//g' | tee $PROFILING_DIR/train.log
+    trainer.total_epochs=1 \
+    "$@" \
+    2>&1 | stdbuf -oL sed 's/\x1b\[[0-9;]*m//g' | tee $PROFILING_DIR/train.log
