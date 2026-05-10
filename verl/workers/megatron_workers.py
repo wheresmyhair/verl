@@ -791,12 +791,45 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
             log_gpu_memory_usage("After copy_actor_to_reverse_infer", logger=logger)
 
-        # 1) old_log_probs (will be replaced by iF interleaved into tF/tB)
+        # 1) old_log_probs
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        old_log_probs, _ = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+
+        # M-B Step 5a: optionally route through reverse-PP infer_module via
+        # DualPipe NCCL P2P (env-gated; default OFF so the validated stub
+        # remains the e2e path until 5a smoke validates parity).
+        use_dualpipe = (
+            os.environ.get("RLPIPE_FUSED_USE_DUALPIPE", "0") == "1"
+            and self.infer_module is not None
+        )
+        if use_dualpipe:
+            from megatron.core import parallel_state as mpu
+            from verl.utils.megatron.dualpipe_executor import compute_log_prob_reverse_pp
+
+            log_gpu_memory_usage("Before dualpipe compute_log_prob", logger=logger)
+            # Build micro-batch list from the data's batch
+            mb_size = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            mbs = []
+            B = data.batch["input_ids"].shape[0]
+            for s in range(0, B, mb_size):
+                e = min(s + mb_size, B)
+                mbs.append({
+                    "input_ids": data.batch["input_ids"][s:e].to(torch.cuda.current_device()),
+                    "attention_mask": data.batch["attention_mask"][s:e].to(torch.cuda.current_device()),
+                    "position_ids": data.batch["position_ids"][s:e].to(torch.cuda.current_device()),
+                    "responses": data.batch["responses"][s:e].to(torch.cuda.current_device()),
+                })
+            old_log_probs = compute_log_prob_reverse_pp(
+                infer_module=self.infer_module,
+                micro_batches=mbs,
+                pp_group=mpu.get_pipeline_model_parallel_group(),
+                temperature=self.config.rollout.temperature,
+            )
+            log_gpu_memory_usage("After dualpipe compute_log_prob", logger=logger)
+        else:
+            old_log_probs, _ = self.actor.compute_log_prob(data=data, calculate_entropy=False)
 
         # attach to data so update_policy sees it
         data.batch["old_log_probs"] = old_log_probs.to(data.batch["responses"].device)

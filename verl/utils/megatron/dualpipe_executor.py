@@ -293,3 +293,153 @@ class MegatronDualPipeExecutor:
                         iF_send_bufs[mb].copy_(output)
 
         return log_probs
+
+
+def compute_log_prob_reverse_pp(
+    *,
+    infer_module,
+    micro_batches: list,  # list[dict] each with input_ids, attention_mask, position_ids, responses
+    pp_group,
+    temperature: float = 1.0,
+    pad_to_seq_len: int = None,
+):
+    """Reverse-PP compute_log_prob via DualPipe-style NCCL P2P.
+
+    Each micro-batch flows rank P-1 → ... → 0 through `infer_module`.
+    Last_inf rank (0) computes log_probs from logits + responses; we
+    broadcast the result to all PP ranks for downstream use.
+
+    Per-micro-batch protocol:
+      - boundary k (between iF.k-1 and iF.k):
+          * recv iF.k input hidden (if not first_inf)
+          * send iF.k-1 output hidden (if not last_inf and k>0)
+      - compute iF.k via infer_module(input_ids, ...)
+      - last_inf: extract log_probs[response slice] from logits
+    Final drain: send iF.M-1 output (if not last_inf).
+
+    NOTE: This routes the forward through `infer_module` which has
+    REVERSED layer assignment + correct pre/post_process flags from
+    `build_reverse_pp_inference_model`. The model expects
+    set_input_tensor(recv_hidden) for non-pre_process stages.
+
+    Returns: log_probs tensor of shape (total_B, response_length) on
+             every PP rank (broadcast from last_inf).
+    """
+    pp_size = dist.get_world_size(pp_group)
+    pp_rank = dist.get_rank(pp_group)
+    pp_world_ranks = dist.get_process_group_ranks(pp_group)
+    rev_pp = pp_size - 1 - pp_rank
+    is_first_inf = (rev_pp == 0)
+    is_last_inf = (rev_pp == pp_size - 1)
+
+    prev_world = pp_world_ranks[pp_rank + 1] if pp_rank + 1 < pp_size else None
+    next_world = pp_world_ranks[pp_rank - 1] if pp_rank - 1 >= 0 else None
+
+    M = len(micro_batches)
+    if M == 0:
+        return torch.zeros(0)
+
+    # Probe hidden shape from first_inf (rank P-1) for the recv buffer
+    # allocation. We use input shape & infer_module config to derive.
+    sample_ids = micro_batches[0]["input_ids"]
+    bsz = sample_ids.shape[0]
+    seq_len = pad_to_seq_len if pad_to_seq_len else sample_ids.shape[1]
+    cfg = infer_module.config
+    hidden_size = cfg.hidden_size
+    # Megatron expects (seq, batch, hidden) for PP transfer with seq-first
+    # layout (variable_seq_lengths ON). For pack_seqs=False / no padding
+    # path it's (batch, seq, hidden). We use seq-first as Megatron default.
+    hidden_shape = (seq_len, bsz, hidden_size)
+    dtype = next(infer_module.parameters()).dtype
+    device = next(infer_module.parameters()).device
+
+    TAG_iF = lambda mb: 30000 + mb  # large base to avoid collision
+
+    log_probs_per_mb = {}
+    last_compute_hidden = None  # output of iF.k-1, kept on GPU for next boundary's send
+
+    for k in range(M):
+        comm_ops = []
+        recv_buf = None
+        if not is_first_inf:
+            recv_buf = torch.empty(hidden_shape, dtype=dtype, device=device)
+            comm_ops.append(dist.P2POp(
+                op=dist.irecv,
+                tensor=recv_buf,
+                peer=prev_world,
+                group=pp_group,
+                tag=TAG_iF(k),
+            ))
+        if k > 0 and not is_last_inf and last_compute_hidden is not None:
+            comm_ops.append(dist.P2POp(
+                op=dist.isend,
+                tensor=last_compute_hidden,
+                peer=next_world,
+                group=pp_group,
+                tag=TAG_iF(k - 1),
+            ))
+
+        if comm_ops:
+            reqs = dist.batch_isend_irecv(comm_ops)
+            for req in reqs:
+                req.wait()
+
+        # Compute iF.k
+        mb = micro_batches[k]
+        with torch.no_grad():
+            if recv_buf is not None:
+                infer_module.set_input_tensor(recv_buf)
+            # else: first_inf uses embedding(input_ids) internally; don't
+            # set input_tensor (None would mislead the decoder).
+
+            output = infer_module(
+                input_ids=mb["input_ids"],
+                position_ids=mb["position_ids"],
+                attention_mask=mb["attention_mask"],
+            )
+
+        if is_last_inf:
+            # output is logits of shape (batch, seq, vocab_partition).
+            # Apply temperature and compute log_probs over responses.
+            from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+            logits = output / temperature
+            responses = mb["responses"]
+            # Build labels aligned with input_ids; last_response_len-1..-1 are response tokens
+            # log_prob[i] = log P(response_i | prefix_<= i-1)
+            response_length = responses.size(1)
+            position_ids = mb["position_ids"]
+            label = position_ids.clone()
+            label[:, -response_length - 1 : -1] = responses
+            log_probs = vocab_parallel_log_probs_from_logits(logits, label)
+            # Slice to response positions only
+            log_probs = log_probs[:, -response_length - 1 : -1].contiguous()
+            log_probs_per_mb[k] = log_probs
+            last_compute_hidden = None
+        else:
+            # output is hidden state to forward
+            last_compute_hidden = output.contiguous()
+
+    # Final drain
+    if not is_last_inf and last_compute_hidden is not None:
+        reqs = dist.batch_isend_irecv([dist.P2POp(
+            op=dist.isend,
+            tensor=last_compute_hidden,
+            peer=next_world,
+            group=pp_group,
+            tag=TAG_iF(M - 1),
+        )])
+        for req in reqs:
+            req.wait()
+
+    # Aggregate log_probs across micro-batches on last_inf, then broadcast
+    last_inf_world = pp_world_ranks[pp_size - 1 - (pp_size - 1)]  # = world rank corresponding to rev_pp=P-1 = global rank 0
+    if is_last_inf:
+        all_log_probs = torch.cat([log_probs_per_mb[k] for k in range(M)], dim=0).to(torch.float32)
+    else:
+        # Allocate matching shape based on first mb's shape × M
+        total_B = sum(mb["responses"].shape[0] for mb in micro_batches)
+        response_length = micro_batches[0]["responses"].shape[1]
+        all_log_probs = torch.empty((total_B, response_length), dtype=torch.float32, device=device)
+
+    dist.broadcast(all_log_probs, src=last_inf_world, group=pp_group)
+    return all_log_probs
