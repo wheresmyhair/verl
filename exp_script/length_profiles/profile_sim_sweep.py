@@ -32,7 +32,7 @@ PROFILE_NAMES = _discover() or [
     "P4_tight_long", "P5_bimodal", "P6_saturated",
 ]
 W_VALUES = [4, 8, 16, 32]
-S_VALUES = [4, 8, 16, 32, 64]
+S_VALUES = [4, 8, 16, 32, 64, 128, 256]
 ROUTINGS = ["random", "verl_default", "prompt_grouped", "lpt_greedy"]
 SEEDS = 3
 

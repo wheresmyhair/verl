@@ -17,7 +17,7 @@ mkdir -p "$PROFILING_DIR"
 
 ENGINE=sglang
 ROLLOUT_TP=1
-GPU_MEMORY_UTILIZATION=0.7
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.7}
 
 python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_torch_pp_trainer' \
 	algorithm.adv_estimator=grpo \

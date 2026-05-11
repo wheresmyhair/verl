@@ -26,6 +26,9 @@ import os
 import sys
 from pathlib import Path
 
+# Silence HF datasets progress bar for cleaner logs.
+os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+
 
 def _load(name: str, max_examples: int | None):
     """Return list[dict] with keys {"question", "answer", "source"}."""
@@ -79,15 +82,39 @@ def _load(name: str, max_examples: int | None):
             for ex in (ds.select(range(min(max_examples, len(ds)))) if max_examples else ds)
         ]
     if name == "livecodebench":
-        ds = load_dataset(
-            "livecodebench/code_generation_lite",
-            version_tag="release_v5", split="test",
-        )
-        return [
-            {"question": ex["question_content"], "answer": None,
-             "source": "livecodebench"}
-            for ex in (ds.select(range(min(max_examples, len(ds)))) if max_examples else ds)
-        ]
+        # Upstream `code_generation_lite` uses a legacy loading script
+        # that datasets>=4.0 rejects. Fetch the latest test JSONL directly
+        # from the HF hub via hf_hub_download and parse ourselves. The
+        # latest cut is test6.jsonl (updated 2025); fall back to earlier
+        # if unavailable.
+        from huggingface_hub import hf_hub_download
+        candidates = ["test6.jsonl", "test5.jsonl", "test4.jsonl", "test3.jsonl", "test2.jsonl", "test.jsonl"]
+        rows = []
+        for fn in candidates:
+            try:
+                path = hf_hub_download(
+                    repo_id="livecodebench/code_generation_lite",
+                    filename=fn, repo_type="dataset",
+                )
+                with open(path) as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        ex = json.loads(line)
+                        q = ex.get("question_content") or ex.get("problem")
+                        if q:
+                            rows.append({
+                                "question": q, "answer": None,
+                                "source": "livecodebench",
+                            })
+                break  # first successful file wins
+            except Exception:
+                continue
+        if not rows:
+            raise RuntimeError("Could not load livecodebench from hub")
+        if max_examples:
+            rows = rows[:max_examples]
+        return rows
     if name == "codecontests":
         ds = load_dataset("deepmind/code_contests", split="test")
         return [
