@@ -31,15 +31,15 @@ def _parse_op(op: str) -> Tuple[str, int]:
 
 
 def _priority_key(op: str):
-    """Sort key for greedy SelectOp.
+    """Sort key for greedy SelectOp: (mb primary, type tie-break iF > tB > tF).
 
-    NOTE: the tex pseudocode says "smallest mb primary, type tie-break",
-    but the reference schedule it lists requires the OPPOSITE: type
-    primary (iF > tB > tF), mb secondary. We follow the reference.
+    Per tex pseudocode. This produces interleaved iF/tF on middle ranks,
+    which keeps each op-boundary's P2P contained to a single peer —
+    important for NCCL `batch_isend_irecv` to work without hangs.
     """
     kind, mb = _parse_op(op)
     kind_pri = {"iF": 0, "tB": 1, "tF": 2}[kind]
-    return (kind_pri, mb)
+    return (mb, kind_pri)
 
 
 def _last_rank_schedule(M: int) -> List[str]:
@@ -107,8 +107,19 @@ def build_fused_schedule(P: int, M: int) -> List[List[str]]:
             if rank_busy_until[r] > t:
                 continue  # rank still computing previous op
 
+            # Additional constraint matching the tex reference: tB.k
+            # cannot dispatch until all iF.0..iF.M-1 on THIS rank are
+            # dispatched. This avoids inserting tB ops in the middle of
+            # the iF burst, and (more importantly for our runtime) keeps
+            # every op-boundary's P2P contained to ONE peer — NCCL P2P
+            # via batch_isend_irecv hangs in our setup when a single
+            # boundary issues comms with multiple peers.
+            iFs_still_pending = any(o.startswith("iF.") for o in pending[r])
+
             ready = []
             for op in pending[r]:
+                if op.startswith("tB.") and iFs_still_pending:
+                    continue
                 dep = upstream_dep(r, op)
                 if dep is None:
                     ready.append(op)
