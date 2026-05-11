@@ -797,14 +797,52 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
 
-        # M-B Step 5a: optionally route through reverse-PP infer_module via
-        # DualPipe NCCL P2P (env-gated; default OFF so the validated stub
-        # remains the e2e path until 5a smoke validates parity).
+        # M-B Step 5b-C: full fused (iF + tF/tB interleaved) via FusedPPExecutor.
+        # Currently uses PLACEHOLDER loss (output**2.sum() / M) — gradients
+        # are NOT correct for real training; this path is for ARCHITECTURE
+        # validation only. Step 5b-D will replace with real PPO loss.
+        use_dualpipe_v2 = (
+            os.environ.get("RLPIPE_FUSED_USE_DUALPIPE_V2", "0") == "1"
+            and self.infer_module is not None
+        )
+        # M-B Step 5a: iF-only via reverse-PP infer_module (no fusion with
+        # training; replaces only the compute_log_prob backend).
         use_dualpipe = (
             os.environ.get("RLPIPE_FUSED_USE_DUALPIPE", "0") == "1"
             and self.infer_module is not None
         )
-        if use_dualpipe:
+        if use_dualpipe_v2:
+            from megatron.core import parallel_state as mpu
+            from verl.utils.megatron.fused_training_executor import run_fused_forward_backward
+
+            log_gpu_memory_usage("Before dualpipe-v2 fused run", logger=logger)
+            mb_size = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            mbs = []
+            B = data.batch["input_ids"].shape[0]
+            for s in range(0, B, mb_size):
+                e = min(s + mb_size, B)
+                mbs.append({
+                    "input_ids": data.batch["input_ids"][s:e].to(torch.cuda.current_device()),
+                    "attention_mask": data.batch["attention_mask"][s:e].to(torch.cuda.current_device()),
+                    "position_ids": data.batch["position_ids"][s:e].to(torch.cuda.current_device()),
+                    "responses": data.batch["responses"][s:e].to(torch.cuda.current_device()),
+                })
+            pp_group = mpu.get_pipeline_model_parallel_group()
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            pp_world_ranks = torch.distributed.get_process_group_ranks(pp_group)
+            old_log_probs, fused_metrics = run_fused_forward_backward(
+                actor_module=self.actor_module,
+                infer_module=self.infer_module,
+                micro_batches=mbs,
+                pp_group=pp_group,
+                pp_world_ranks=pp_world_ranks,
+                temperature=self.config.rollout.temperature,
+                dtype=self.dtype,
+            )
+            log_gpu_memory_usage("After dualpipe-v2 fused run", logger=logger)
+            if self.rank == 0:
+                logger.info("[fused-v2] metrics: %s", fused_metrics)
+        elif use_dualpipe:
             from megatron.core import parallel_state as mpu
             from verl.utils.megatron.dualpipe_executor import compute_log_prob_reverse_pp
 
