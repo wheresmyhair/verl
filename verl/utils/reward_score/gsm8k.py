@@ -28,9 +28,16 @@ def extract_solution(solution_str, method="strict"):
 
     if method == "strict":
         # this also tests the formatting of the model
+        # Try #### format first, then fall back to \boxed{} format
         solutions = re.findall("#### (\\-?[0-9\\.\\,]+)", solution_str)
         if len(solutions) == 0:
-            final_answer = None
+            # Try \boxed{answer} format (common in Qwen3 and other reasoning models)
+            # Match both \\boxed (raw string) and \boxed (decoded output)
+            boxed = re.findall(r"\\?boxed\{(\-?[0-9\.\,\s]+)\}", solution_str)
+            if len(boxed) == 0:
+                final_answer = None
+            else:
+                final_answer = boxed[-1].strip().replace(",", "").replace("$", "")
         else:
             # take the last solution
             final_answer = solutions[-1].replace(",", "").replace("$", "")

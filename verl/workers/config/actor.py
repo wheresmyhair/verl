@@ -25,7 +25,7 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig", "TorchPPActorConfig"]
 
 
 @dataclass
@@ -204,6 +204,12 @@ class McoreActorConfig(ActorConfig):
     load_weight: bool = True
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)
+    # Fused forward: interleave inference iF into training PP bubbles so
+    # compute_log_prob piggybacks on update_actor's PP schedule. Uses
+    # gloo pair-groups for fused-phase P2P (NCCL P2P deadlocks on the
+    # required asymmetric pre-post; see project_megatron_two_pp_deadlock_tbd).
+    # Requires `fused_p2p` pair groups created at init.
+    fused_forward: bool = False
 
 
 @dataclass
@@ -246,3 +252,27 @@ class FSDPActorConfig(ActorConfig):
                 raise ValueError(
                     "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
                 )
+
+
+@dataclass
+class TorchPPActorConfig(ActorConfig):
+    """Configuration for Torch naive PP actor models.
+
+    Each GPU = 1 PP stage for training. No FSDP, no TP/EP. Just naive PP
+    with optional fused forward for computing old_log_probs inline.
+
+    Args:
+        strategy: Training strategy set to 'torch_naive_pp'.
+        grad_clip: Gradient clipping threshold.
+        param_offload: Whether to offload model parameters to CPU.
+        optimizer_offload: Whether to offload optimizer states to CPU.
+        fused_forward: Whether to use fused forward (inline inference in PP bubbles).
+        num_micro_batches: Number of micro-batches for PP schedule.
+    """
+
+    strategy: str = "torch_naive_pp"
+    grad_clip: float = 1.0
+    param_offload: bool = False
+    optimizer_offload: bool = False
+    fused_forward: bool = False
+    num_micro_batches: int = 4

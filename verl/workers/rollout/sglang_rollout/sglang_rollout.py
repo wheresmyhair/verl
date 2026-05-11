@@ -194,6 +194,33 @@ def _extract_logprob_from_output(output):
     return output_token_ids, log_probs
 
 
+def _dump_token_data(filename_stem: str, records: list):
+    """Dump per-request token data to JSON for baseline vs fan-in comparison.
+    Gated by RLPIPE_FANIN_TOKEN_DUMP env var."""
+    dump_dir = os.environ.get("RLPIPE_FANIN_TOKEN_DUMP")
+    if not dump_dir:
+        return
+    import json as _json
+    path = os.path.join(dump_dir, f"{filename_stem}.json")
+    with open(path, "w") as f:
+        _json.dump(records, f, indent=2)
+    logger.warning(f"[token-dump] wrote {len(records)} records to {path}")
+
+
+def _extract_token_data(resp):
+    """Extract output_ids and logprob-derived token IDs from an SGLang response."""
+    if isinstance(resp, list) and resp:
+        resp = resp[0]
+    if not isinstance(resp, dict):
+        return [], [], None
+    meta = resp.get("meta_info") or {}
+    output_ids = list(resp.get("output_ids", meta.get("output_ids", [])))
+    logprob_entries = meta.get("output_token_logprobs", [])
+    logprob_ids = [entry[1] for entry in logprob_entries] if logprob_entries else []
+    finish_reason = meta.get("finish_reason", {})
+    return output_ids, logprob_ids, finish_reason
+
+
 # NOTE(linjunrong): adhoc
 def _post_process_outputs(processing_class, output):
     try:
@@ -207,7 +234,10 @@ def _post_process_outputs(processing_class, output):
             raise ValueError(f"Cannot get tokenizer from processing_class {processing_class}") from e
 
     def _map_each_response(resp):
-        output_token_logprobs = resp["meta_info"]["output_token_logprobs"]
+        output_token_logprobs = resp.get("meta_info", {}).get("output_token_logprobs", [])
+        if not output_token_logprobs:
+            # Aborted or empty response — return empty tensors
+            return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.float32)
         log_probs, output_token_ids = zip(
             *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
         )
@@ -398,6 +428,29 @@ class SGLangRollout(BaseRollout):
             self.config.multi_turn.max_user_turns = self.config.max_model_len // 3
 
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
+        # rlpipe dynamic-tp: opt-in via VERL_SGLANG_DYNAMIC_TP=1. Must set
+        # SGLANG_DYNAMIC_TP/INITIAL *before* AsyncEngine() spawns scheduler
+        # subprocesses so children inherit the env and the ModelRegistry
+        # alias (Qwen2/Qwen3 -> Qwen2DynamicForCausalLM) installs in each
+        # child at registry import time. INITIAL=tp avoids the LogitsProcessor
+        # gather-flag defect from task #25; we switch to dp post-init below.
+        self._rlpipe_dynamic_tp = os.environ.get("VERL_SGLANG_DYNAMIC_TP") == "1"
+        if self._rlpipe_dynamic_tp:
+            os.environ["SGLANG_DYNAMIC_TP"] = "1"
+            os.environ.setdefault("SGLANG_DYNAMIC_TP_INITIAL", "tp")
+            logger.info("rlpipe dynamic-tp: enabling in SGLangRollout")
+        # rlpipe sgfanin perfetto tracing: propagate RLPIPE_SGFANIN_TRACE
+        # to the sglang scheduler subprocesses via RLPIPE_SGFANIN_TRACE_DIR.
+        # The scheduler determines its own rank via self.tp_rank, so we only
+        # need to tell it the dir. Each of the 4 TP rank subprocesses writes
+        # its own sched_rank{R}.jsonl file.
+        if os.environ.get("RLPIPE_SGFANIN_TRACE"):
+            os.environ["RLPIPE_SGFANIN_TRACE_DIR"] = os.environ["RLPIPE_SGFANIN_TRACE"]
+            logger.info(
+                "rlpipe sgfanin: sched subprocesses will write sched_rank{tp_rank}.jsonl to %s",
+                os.environ["RLPIPE_SGFANIN_TRACE"],
+            )
+
         # initialize the inference engine
         nnodes = -(-self._tp_size // len(self.visible_devices_set))
         if nnodes > 1:
@@ -481,6 +534,20 @@ class SGLangRollout(BaseRollout):
                 self._engine = AsyncHttpServerAdapter(**args)
             else:
                 self._engine = AsyncEngine(**args)
+                # rlpipe dynamic-tp: after boot-in-tp, switch topology to dp
+                # so the rollout body runs in DP mode (each rank owns its
+                # own request subset, matching target_rank round-robin from
+                # TokenizerManager). The switch is <10 ms at Qwen3-1.7B and
+                # reuses the pre-captured CUDA graphs for both topologies.
+                if self._rlpipe_dynamic_tp:
+                    sw_result = self._engine.set_dynamic_topology("dp")
+                    assert sw_result.success, (
+                        f"rlpipe dynamic-tp: set_dynamic_topology(dp) failed: "
+                        f"{sw_result}"
+                    )
+                    logger.info(
+                        "rlpipe dynamic-tp: switched to dp topology after boot"
+                    )
         else:
             self._engine = None
 
@@ -724,22 +791,126 @@ class SGLangRollout(BaseRollout):
         # Update with any additional kwargs
         request_sampling_params.update(kwargs)
 
+        progressive_threshold = self.config.get("progressive_threshold", None)
+        # Only use progressive for main rollout (not validation), and when batch is large enough
+        use_progressive = (
+            progressive_threshold is not None
+            and progressive_threshold < 1.0
+            and not is_validate
+            and batch_size > 10
+        )
+
+        # rlpipe fan-in (Idea 1 v1): opt-in via VERL_RLPIPE_FANIN=1 env var
+        # AND requires the engine to have been booted with
+        # VERL_SGLANG_DYNAMIC_TP=1. See fanin_architecture_v1.md for scope.
+        # Mutually exclusive with `use_progressive` (they're both trying to
+        # do something with the straggler tail — fan-in is the richer one).
+        fanin_enabled = (
+            os.environ.get("VERL_RLPIPE_FANIN") == "1"
+            and getattr(self, "_rlpipe_dynamic_tp", False)
+            and not is_validate
+            and batch_size > 10
+        )
+        fanin_min_idle_ranks = int(
+            os.environ.get("VERL_RLPIPE_FANIN_MIN_IDLE", str(max(1, self._tp_size // 2)))
+        )
+
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
-            output = loop.run_until_complete(
-                self._engine.async_generate(
-                    prompt=None,  # because we have already convert it to prompt token id
-                    sampling_params=request_sampling_params,
-                    return_logprob=True,
-                    input_ids=idx_list,
-                    image_data=image_list,
+            if fanin_enabled:
+                # Fan-in: stage-1 DP rollout, trigger on K idle ranks,
+                # abort stragglers, switch to TP, re-prefill + decode.
+                per_req_final, fanin_fired, fanin_timing = loop.run_until_complete(
+                    self._fanin_generate(
+                        idx_list, image_list, request_sampling_params,
+                        return_logprob=True,
+                        min_idle_ranks=fanin_min_idle_ranks,
+                    )
                 )
-            )
+                # _fanin_generate returns a list aligned to idx_list; convert
+                # to the dict format _reassemble_batch_output expects.
+                per_req_results = {
+                    i: per_req_final[i]
+                    for i in range(batch_size)
+                    if per_req_final[i] is not None
+                }
+                output = self._reassemble_batch_output(per_req_results, batch_size)
+                if fanin_fired:
+                    logger.info(
+                        f"[fanin] rollout complete: fired=True"
+                        f" timing={fanin_timing}"
+                    )
+                else:
+                    logger.info(
+                        f"[fanin] rollout complete: fired=False"
+                        f" (no idle trigger reached; timing={fanin_timing})"
+                    )
+                # After the rollout step, switch back to DP for the NEXT
+                # rollout step. The verl rollout lifecycle is: update_actor
+                # -> next step's rollout, so we need to be in DP mode by the
+                # start of next step. Switch back synchronously.
+                if fanin_fired:
+                    try:
+                        sw_back = self._engine.set_dynamic_topology(
+                            topology="dp",
+                            kv_handover_strategy="drop",
+                        )
+                        if not getattr(sw_back, "success", False):
+                            logger.error(f"[fanin] switch-back to dp failed: {sw_back}")
+                        else:
+                            logger.info("[fanin] switched back to dp for next step")
+                    except Exception as e:
+                        logger.exception(f"[fanin] switch-back raised: {e}")
+            elif use_progressive:
+                # Progressive generation: per-request + early return
+                per_req_results, aborted, prog_elapsed = loop.run_until_complete(
+                    self._progressive_generate(
+                        idx_list, image_list, request_sampling_params,
+                        return_logprob=True,
+                        threshold=progressive_threshold,
+                    )
+                )
+                output = self._reassemble_batch_output(per_req_results, batch_size)
+                if aborted:
+                    logger.info(f"Progressive rollout: {len(aborted)} of {batch_size} requests aborted "
+                                f"(threshold={progressive_threshold}, elapsed={prog_elapsed:.1f}s)")
+            else:
+                output = loop.run_until_complete(
+                    self._engine.async_generate(
+                        prompt=None,
+                        sampling_params=request_sampling_params,
+                        return_logprob=True,
+                        input_ids=idx_list,
+                        image_data=image_list,
+                    )
+                )
+            # rlpipe token dump: save per-request output for divergence analysis.
+            # Fan-in path dumps from inside _fanin_generate (richer data).
+            if not fanin_enabled and os.environ.get("RLPIPE_FANIN_TOKEN_DUMP"):
+                records = []
+                for i in range(batch_size):
+                    resp = output[i] if isinstance(output, list) and i < len(output) else output
+                    oids, lp_ids, fr = _extract_token_data(resp)
+                    records.append({
+                        "request_index": i,
+                        "prompt_ids": list(idx_list[i]),
+                        "output_ids": oids,
+                        "logprob_ids": lp_ids,
+                        "output_len": len(oids),
+                        "logprob_len": len(lp_ids),
+                        "finish_reason": str(fr),
+                        "mode": "baseline",
+                    })
+                # In stock DP mode (tp_size=1), each rank independently
+                # calls this with its own slice. Use rank in filename
+                # to avoid clobbering. The comparison script reads all.
+                _rank_tag = f"_rank{dist.get_rank()}" if self._tp_size == 1 else ""
+                _dump_token_data(f"baseline{_rank_tag}", records)
         else:
             output = None
 
         # Most naive implementation, can extract tensor and send via gloo if too slow
-        dist.barrier()
+        dist.barrier(group=self._device_mesh_cpu["tp"].get_group())
         [output] = broadcast_pyobj(
             data=[output],
             rank=self._rank,
@@ -778,6 +949,10 @@ class SGLangRollout(BaseRollout):
         response_attention_mask = get_response_mask(
             response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
         )
+        # rlpipe: derive actual response lengths from response mask (before padding)
+        non_tensor_batch["response_lengths"] = np.array(
+            response_attention_mask.sum(dim=-1).tolist(), dtype=object
+        )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
@@ -801,6 +976,458 @@ class SGLangRollout(BaseRollout):
             loop.run_until_complete(self._engine.flush_cache())
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Progressive generation: per-request submission + early return
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _progressive_generate(
+        self,
+        idx_list: list,
+        image_list: list,
+        sampling_params: dict,
+        return_logprob: bool = True,
+        threshold: float = 0.9,
+    ):
+        """Submit individual requests, return when threshold fraction complete.
+
+        Returns:
+            results: dict[int, dict] — per-request outputs (keyed by index)
+            aborted: list[int] — indices of aborted requests
+            elapsed: float — total wall time
+        """
+        import time as _time
+        n = len(idx_list)
+        target = max(1, int(n * threshold))
+        t0 = _time.time()
+
+        # Submit each request individually with unique rid
+        async def _gen_one(i):
+            img = [image_list[i]] if image_list and image_list[i] is not None else None
+            out = await self._engine.async_generate(
+                prompt=None,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                input_ids=[idx_list[i]],
+                image_data=img,
+                rid=f"prog_{id(self)}_{i}",
+            )
+            return i, out
+
+        # Create tasks
+        tasks = [asyncio.create_task(_gen_one(i)) for i in range(n)]
+        results = {}
+        pending = set(range(n))
+
+        # Collect as they complete
+        for coro in asyncio.as_completed(tasks):
+            idx, out = await coro
+            results[idx] = out
+            pending.discard(idx)
+            if len(results) >= target:
+                break
+
+        # Abort remaining and wait for ALL to finish (SGLang requires no
+        # in-flight requests before release_memory_occupation)
+        aborted = sorted(pending)
+        if aborted:
+            for i in aborted:
+                self._engine.tokenizer_manager.abort_request(
+                    rid=f"prog_{id(self)}_{i}"
+                )
+            # Must wait for ALL tasks to fully complete/abort before returning,
+            # otherwise SGLang's release_memory_occupation will assert.
+            remaining_tasks = [tasks[i] for i in aborted if not tasks[i].done()]
+            if remaining_tasks:
+                done, still_pending = await asyncio.wait(remaining_tasks, timeout=30.0)
+                for t in done:
+                    try:
+                        idx, out = t.result()
+                        results[idx] = out
+                    except Exception:
+                        pass
+                # Force-cancel anything truly stuck
+                for t in still_pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        elapsed = _time.time() - t0
+        return results, aborted, elapsed
+
+    # ──────────────────────────────────────────────────────────────────
+    # rlpipe fan-in: progressive DP -> full fan-in TP on straggler tail
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _fanin_generate(
+        self,
+        idx_list: list,
+        image_list: list,
+        sampling_params: dict,
+        return_logprob: bool = True,
+        min_idle_ranks: int = 2,
+    ):
+        """rlpipe Idea 1 v1: submit N requests in fan-out (DP) mode, detect
+        when >= min_idle_ranks DP workers have finished all their assigned
+        requests, then trigger a full fan-in switch to TP, abort in-flight
+        stragglers, re-submit them with (prompt + generated_so_far) as new
+        input, and assemble the final outputs in original batch order.
+
+        This is the v1 of the architecture described in
+        /home/user/rlpipe/fanin_architecture_v1.md. Stage 2 (partial
+        fan-in with mixed TP sizes) is NOT implemented — we only
+        transition stage 1 -> stage 3 once, and never back.
+
+        Trigger policy: deterministic mirror of sglang's round-robin
+        target_rank assignment (i -> i % tp_size). When >= min_idle_ranks
+        DP workers drain their pending count to 0, fire fan-in.
+
+        KV handover: "reprefill" strategy — sglang side drops all KV,
+        verl side holds partial generated_ids from the aborted in-flight
+        requests and re-submits them with (prompt + partial) as the new
+        prompt. Re-prefill cost is bounded by (prompt + partial) length
+        which on heavy-tail workloads is a few thousand tokens per
+        straggler, dominated by the subsequent TP-accelerated decode.
+
+        Returns:
+            results: dict[int, dict] — per-request outputs in original
+                batch order. Aborted-then-resubmitted requests are merged
+                (output_ids = partial + post_reprefill_ids).
+            fanin_fired: bool — whether fan-in was triggered.
+            timing: dict — stage-1 duration, fan-in switch duration,
+                stage-3 duration.
+        """
+        import time as _time
+
+        n = len(idx_list)
+        tp_size = self._tp_size
+        max_new_tokens = int(sampling_params.get("max_new_tokens", 1024))
+
+        # Mirror the TokenizerManager._next_dynamic_target_rank counter.
+        # Assignment is strictly round-robin from counter 0, incrementing
+        # once per submitted request. Our loop below submits in order
+        # i=0..n-1, so target_rank[i] = i % tp_size.
+        request_rank = [i % tp_size for i in range(n)]
+        pending_per_rank = [0] * tp_size
+        for r in request_rank:
+            pending_per_rank[r] += 1
+
+        # Tracking for each request:
+        #   partial_ids[i]: best-effort current output_ids from the stream
+        #   final_out[i]: final output dict (after completion or re-prefill)
+        #   completed[i]: True when stage-1 finished this request cleanly
+        partial_ids: list = [None] * n
+        partial_logprobs: list = [None] * n  # output_token_logprobs at abort time
+        final_out: list = [None] * n
+        completed = [False] * n
+
+        timing = {"stage1": 0.0, "switch": 0.0, "stage3": 0.0}
+        fanin_fired = False
+        stage1_start = _time.time()
+
+        async def _stage1_one(i):
+            out = await self._engine.async_generate(
+                prompt=None,
+                sampling_params=sampling_params,
+                return_logprob=return_logprob,
+                input_ids=[idx_list[i]],
+                image_data=([image_list[i]] if image_list and image_list[i] is not None else None),
+                rid=f"fanin_s1_{id(self)}_{i}",
+            )
+            return i, out
+
+        tasks = [asyncio.create_task(_stage1_one(i)) for i in range(n)]
+        in_flight_indices = set(range(n))
+        # Log rank-transition events to stderr so we can see the exact
+        # moment each rank's pending counter reaches 0 (vs when fan-in
+        # actually fires). Helps diagnose trigger-vs-reality lag.
+        _rank_hit_zero_at = [None] * tp_size
+        _debug_file = os.environ.get("RLPIPE_SGFANIN_FANIN_DEBUG")
+        def _dbg(msg):
+            if _debug_file:
+                with open(_debug_file, "a") as _df:
+                    _df.write(f"[{_time.time():.3f}] {msg}\n")
+        _dbg(f"stage1 begin: n={n} tp_size={tp_size} pending={pending_per_rank}")
+
+        # Stage 1: consume completions until fan-in trigger or all done
+        for coro in asyncio.as_completed(tasks):
+            try:
+                i, out = await coro
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(f"[fanin] stage-1 task failed: {e}")
+                continue
+            in_flight_indices.discard(i)
+            r = request_rank[i]
+            pending_per_rank[r] -= 1
+            if pending_per_rank[r] == 0 and _rank_hit_zero_at[r] is None:
+                _rank_hit_zero_at[r] = _time.time()
+                _dbg(f"rank {r} pending→0 (req i={i}); pending={pending_per_rank}; in_flight={len(in_flight_indices)}")
+            final_out[i] = out
+            completed[i] = True
+            # Stash partial (for completed reqs the partial IS the final).
+            if isinstance(out, list) and out:
+                out = out[0]
+            if isinstance(out, dict):
+                meta = out.get("meta_info") or {}
+                if "output_ids" in out:
+                    partial_ids[i] = list(out["output_ids"])
+                elif "output_ids" in meta:
+                    partial_ids[i] = list(meta["output_ids"])
+
+            idle_count = sum(1 for p in pending_per_rank if p == 0)
+            if (
+                not fanin_fired
+                and idle_count >= min_idle_ranks
+                and in_flight_indices  # still have stragglers
+            ):
+                fanin_fired = True
+                _dbg(f"FIRE fan-in: idle_count={idle_count} pending={pending_per_rank} in_flight={len(in_flight_indices)}")
+                logger.info(
+                    f"[fanin] trigger: {idle_count}/{tp_size} DP ranks idle,"
+                    f" {len(in_flight_indices)} stragglers in flight"
+                    f" (pending_per_rank={pending_per_rank})"
+                )
+                break
+
+        timing["stage1"] = _time.time() - stage1_start
+
+        if not fanin_fired:
+            # Stage 1 completed without triggering — just wait for any stragglers
+            # to finish naturally. (Should be rare at the min_idle_ranks setting.)
+            for coro in asyncio.as_completed([tasks[j] for j in in_flight_indices]):
+                try:
+                    i, out = await coro
+                    final_out[i] = out
+                    completed[i] = True
+                except (asyncio.CancelledError, Exception) as e:
+                    logger.warning(f"[fanin] stage-1 drain task failed: {e}")
+            # Token dump for no-trigger case (all completed in DP)
+            if os.environ.get("RLPIPE_FANIN_TOKEN_DUMP"):
+                records = []
+                for i in range(n):
+                    oids, lp_ids, fr = _extract_token_data(final_out[i])
+                    records.append({
+                        "request_index": i,
+                        "prompt_ids": list(idx_list[i]),
+                        "output_ids": oids,
+                        "logprob_ids": lp_ids,
+                        "output_len": len(oids),
+                        "logprob_len": len(lp_ids),
+                        "finish_reason": str(fr),
+                        "mode": "fanin_no_trigger",
+                        "dp_rank": request_rank[i],
+                    })
+                _dump_token_data("fanin", records)
+            return final_out, fanin_fired, timing
+
+        # Fan-in triggered. Collect straggler state (prompts + partial gen).
+        # abort_request() does not return partial tokens directly — it
+        # fires an AbortReq to the scheduler and the still-running async_generate
+        # returns whatever final state it has. Our tasks below are awaited
+        # after abort and the resulting dict's output_ids contain the
+        # generated tokens up to the abort point. For robustness we ALSO
+        # track partial_ids via the meta_info (which the scheduler
+        # populates on the final aborted response).
+        straggler_indices = sorted(in_flight_indices)
+        logger.info(f"[fanin] aborting {len(straggler_indices)} stragglers for re-prefill")
+        for i in straggler_indices:
+            self._engine.tokenizer_manager.abort_request(
+                rid=f"fanin_s1_{id(self)}_{i}"
+            )
+        # Wait for aborted tasks to fully flush their final state. Use a
+        # 60s timeout — at 14B the scheduler can take 10-20s to process
+        # the AbortReq control message through a busy decode batch.
+        straggler_tasks = [tasks[i] for i in straggler_indices]
+        done, still_pending = await asyncio.wait(straggler_tasks, timeout=60.0)
+        for t in done:
+            try:
+                i, out = t.result()
+                if isinstance(out, list) and out:
+                    out = out[0]
+                if isinstance(out, dict):
+                    meta = out.get("meta_info") or {}
+                    if "output_ids" in out:
+                        partial_ids[i] = list(out["output_ids"])
+                    elif "output_ids" in meta:
+                        partial_ids[i] = list(meta["output_ids"])
+                    # Save partial logprobs for merging in _stage3_one
+                    partial_logprobs[i] = list(meta.get("output_token_logprobs", []))
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(f"[fanin] straggler task drain failed: {e}")
+        # Force-cancel any tasks that didn't complete within the drain
+        # window. MUST catch asyncio.CancelledError explicitly — in
+        # Python 3.8+ it inherits from BaseException, NOT Exception,
+        # so `except Exception` does NOT catch it. If we miss this, the
+        # cancellation propagates up and kills the whole fan-in cycle.
+        for t in still_pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        if still_pending:
+            logger.warning(
+                f"[fanin] force-cancelled {len(still_pending)} straggler"
+                f" tasks that didn't drain within 60s abort timeout"
+            )
+
+        # Switch topology: drop DP pool/graphs, allocate TP pool/graphs.
+        # We're in an async context (loop.run_until_complete owns the event
+        # loop), so we must NOT call the sync Engine.set_dynamic_topology
+        # wrapper (which re-enters the loop and raises
+        # "this event loop is already running"). Go directly to the async
+        # tokenizer_manager method.
+        switch_start = _time.time()
+        try:
+            sw = await self._engine.tokenizer_manager.set_dynamic_topology(
+                topology="tp",
+                kv_handover_strategy="reprefill",
+            )
+            if not getattr(sw, "success", False):
+                logger.error(f"[fanin] topology switch failed: {sw}")
+                timing["switch"] = _time.time() - switch_start
+                return final_out, fanin_fired, timing
+        except Exception as e:
+            logger.exception(f"[fanin] topology switch raised: {e}")
+            timing["switch"] = _time.time() - switch_start
+            return final_out, fanin_fired, timing
+        timing["switch"] = _time.time() - switch_start
+        logger.info(f"[fanin] topology switch to tp completed in {timing['switch']*1000:.0f} ms")
+
+        # Stage 3: re-submit stragglers with (prompt + partial) as new input,
+        # remaining budget as max_new_tokens, all running under TP topology.
+        stage3_start = _time.time()
+
+        async def _stage3_one(i):
+            partial = partial_ids[i] or []
+            new_input = list(idx_list[i]) + list(partial)
+            remaining_budget = max(1, max_new_tokens - len(partial))
+            new_sp = dict(sampling_params)
+            new_sp["max_new_tokens"] = remaining_budget
+            out = await self._engine.async_generate(
+                prompt=None,
+                sampling_params=new_sp,
+                return_logprob=return_logprob,
+                input_ids=[new_input],
+                rid=f"fanin_s3_{id(self)}_{i}",
+            )
+            # Merge partial + newly-generated tokens into a single output_ids.
+            if isinstance(out, list) and out:
+                out = out[0]
+            if isinstance(out, dict):
+                meta = out.get("meta_info") or {}
+                new_ids = None
+                if "output_ids" in out:
+                    new_ids = list(out["output_ids"])
+                elif "output_ids" in meta:
+                    new_ids = list(meta["output_ids"])
+                if new_ids is not None:
+                    merged = list(partial) + new_ids
+                    if "output_ids" in out:
+                        out["output_ids"] = merged
+                    if "output_ids" in meta:
+                        meta["output_ids"] = merged
+                    meta["completion_tokens"] = len(merged)
+                    # Merge output_token_logprobs: partial (from stage-1
+                    # abort) + new (from stage-3 TP decode). Without this,
+                    # _post_process_outputs only sees stage-3 logprobs and
+                    # loses all partial tokens from the response.
+                    s1_logprobs = partial_logprobs[i] or []
+                    s3_logprobs = list(meta.get("output_token_logprobs", []))
+                    meta["output_token_logprobs"] = s1_logprobs + s3_logprobs
+                    out["meta_info"] = meta
+            return i, out
+
+        s3_tasks = [asyncio.create_task(_stage3_one(i)) for i in straggler_indices]
+        for coro in asyncio.as_completed(s3_tasks):
+            try:
+                i, out = await coro
+                final_out[i] = out
+                completed[i] = True
+            except (asyncio.CancelledError, Exception) as e:
+                logger.warning(f"[fanin] stage-3 task failed: {e}")
+
+        timing["stage3"] = _time.time() - stage3_start
+        logger.info(
+            f"[fanin] done: stage1={timing['stage1']*1000:.0f}ms"
+            f" switch={timing['switch']*1000:.0f}ms"
+            f" stage3={timing['stage3']*1000:.0f}ms"
+            f" total={(timing['stage1']+timing['switch']+timing['stage3'])*1000:.0f}ms"
+        )
+
+        # rlpipe token dump: per-request data with partial/stage3 split for
+        # divergence analysis against baseline. Captures both output_ids
+        # (which we merge) and output_token_logprobs-derived ids (which
+        # _post_process_outputs actually uses).
+        if os.environ.get("RLPIPE_FANIN_TOKEN_DUMP"):
+            records = []
+            for i in range(n):
+                resp = final_out[i]
+                oids, lp_ids, fr = _extract_token_data(resp)
+                is_straggler = i in set(straggler_indices) if fanin_fired else False
+                rec = {
+                    "request_index": i,
+                    "prompt_ids": list(idx_list[i]),
+                    "output_ids": oids,
+                    "logprob_ids": lp_ids,
+                    "output_len": len(oids),
+                    "logprob_len": len(lp_ids),
+                    "finish_reason": str(fr),
+                    "mode": "fanin_straggler" if is_straggler else "fanin_completed",
+                    "dp_rank": request_rank[i],
+                }
+                if is_straggler:
+                    p = partial_ids[i] or []
+                    rec["partial_ids"] = list(p)
+                    rec["partial_len"] = len(p)
+                    rec["stage3_new_ids"] = oids[len(p):] if len(oids) > len(p) else []
+                    rec["stage3_new_len"] = len(rec["stage3_new_ids"])
+                records.append(rec)
+            _dump_token_data("fanin", records)
+
+        return final_out, fanin_fired, timing
+
+    def _reassemble_batch_output(self, per_request_results: dict, batch_size: int):
+        """Reassemble per-request outputs into list-of-dicts format.
+
+        _post_process_outputs expects output to be a LIST of per-response dicts:
+          [{"text": "...", "meta_info": {...}}, {"text": "...", "meta_info": {...}}, ...]
+
+        SGLang async_generate with input_ids=[single_prompt] returns either:
+          - A list of 1 dict: [{"text": "...", "meta_info": {...}}]
+          - Or a single dict: {"text": "...", "meta_info": {...}}
+        """
+        batch_output = []
+        for i in range(batch_size):
+            out = per_request_results.get(i)
+            if out is None:
+                # Request was aborted with no response
+                batch_output.append({
+                    "text": "",
+                    "meta_info": {
+                        "output_token_logprobs": [],
+                        "completion_tokens": 0,
+                        "finish_reason": {"type": "abort"},
+                    },
+                })
+                continue
+
+            # Normalize: extract single response from batch-of-1
+            if isinstance(out, list):
+                out = out[0] if out else {}
+            elif isinstance(out, dict):
+                # Check if it's batch-of-1 format (values are lists of len 1)
+                # e.g. {"text": ["hello"], "meta_info": [{...}]}
+                first_val = next(iter(out.values()), None)
+                if isinstance(first_val, list) and len(first_val) == 1:
+                    out = {k: v[0] if isinstance(v, list) and len(v) == 1 else v
+                           for k, v in out.items()}
+
+            batch_output.append(out)
+
+        return batch_output
 
     async def _async_rollout_a_request(
         self,
@@ -1177,7 +1804,7 @@ class SGLangRollout(BaseRollout):
         else:
             sorted_output_req_list = None
 
-        dist.barrier()
+        dist.barrier(group=self._device_mesh_cpu["tp"].get_group())
         [sorted_output_req_list] = broadcast_pyobj(
             data=[sorted_output_req_list],
             rank=self._rank,
@@ -1531,6 +2158,100 @@ class SGLangRollout(BaseRollout):
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
+
+    async def init_weights_update_group(self, coord) -> None:
+        """Initialize the NCCL collective group for distributed weight sync.
+
+        Forwards to sglang's tokenizer_manager → scheduler → tp_workers,
+        each of which calls `init_custom_process_group(rank=1+local_rank,
+        world_size=1+sglang_tp_size)`. Must be called CONCURRENTLY with
+        the actor side's `coord.init_actor_side()`; both sides rendezvous
+        at TCPStore master_addr:master_port.
+
+        Args:
+            coord: a `DistributedWeightSyncCoordinator` with master_addr,
+                master_port, group_name configured.
+        """
+        # Only TP rank 0 issues the RPC; the dispatcher fans out internally
+        if self.device_mesh["infer_tp"].get_local_rank() != 0:
+            return
+        from sglang.srt.managers.io_struct import InitWeightsUpdateGroupReqInput
+        obj = InitWeightsUpdateGroupReqInput(
+            master_address=coord.master_addr,
+            master_port=coord.master_port,
+            rank_offset=1,
+            world_size=coord.world_size,
+            group_name=coord.group_name,
+            backend=coord.backend,
+        )
+        result = await self._engine.tokenizer_manager.init_weights_update_group(obj, None)
+        ok = result[0] if isinstance(result, tuple) else getattr(result, "success", True)
+        if not ok:
+            msg = result[1] if isinstance(result, tuple) else getattr(result, "message", "unknown")
+            raise RuntimeError(f"sglang init_weights_update_group failed: {msg}")
+
+    async def update_weights_distributed(
+        self, weights, coord, actor_pp_rank: int = 0, **kwargs,
+    ):
+        """NCCL-collective weight update, bypassing CUDA IPC.
+
+        Use when `weight_sync_mode == "distributed"` (e.g. docker without
+        CAP_SYS_PTRACE; see `verl/utils/megatron/distributed_weight_sync.py`).
+
+        Flow:
+          1. Materialize per_tensor_param into parallel name/dtype/shape/tensor lists
+          2. Dispatch update_weights_from_distributed RPC to sglang scheduler
+             — internally posts dist.broadcast(buf, src=0) for each tensor
+          3. Concurrently, actor PP rank 0 calls coord.broadcast(tensor) per tensor
+             matching sglang's broadcasts in order via the shared NCCL group
+
+        Args:
+            weights: Generator yielding (name, tensor). On non-PP-rank-0
+                ranks, may be the same generator (already gathered) but
+                we skip the broadcasts there.
+            coord: DistributedWeightSyncCoordinator (init'd via init_actor_side
+                on rank 0 + init_weights_update_group on this side)
+            actor_pp_rank: actor's PP rank in megatron (only rank 0 sends)
+        """
+        import asyncio
+        from sglang.srt.managers.io_struct import UpdateWeightsFromDistributedReqInput
+
+        # Materialize: needed because sglang's RPC takes meta upfront,
+        # but we need the actual tensors for the matching broadcasts.
+        weights_list = list(weights)
+        names = [n for n, _ in weights_list]
+        dtypes = [str(t.dtype).removeprefix("torch.") for _, t in weights_list]
+        shapes = [list(t.shape) for _, t in weights_list]
+        tensors = [t for _, t in weights_list]
+
+        rpc_task = None
+        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            obj = UpdateWeightsFromDistributedReqInput(
+                names=names, dtypes=dtypes, shapes=shapes,
+                group_name=coord.group_name, flush_cache=True,
+            )
+            # Schedule the sglang side to post broadcasts. sglang scheduler
+            # subprocess will iterate and post dist.broadcast(empty, src=0)
+            # for each tensor in order. We MUST issue our matching
+            # broadcasts in the same order at roughly the same time for
+            # NCCL to match.
+            rpc_task = asyncio.create_task(
+                self._engine.tokenizer_manager.update_weights_from_distributed(obj, None)
+            )
+
+        # Issue actor-side broadcasts (only PP rank 0 sends)
+        if actor_pp_rank == 0:
+            # Yield to give the RPC a chance to dispatch + sglang scheduler
+            # to start its broadcast loop. Without this the actor might
+            # post its broadcast before sglang has posted its recv.
+            await asyncio.sleep(0)
+            for tensor in tensors:
+                # Synchronous NCCL broadcast — blocks this coroutine until
+                # the matching sglang recv arrives.
+                coord.broadcast(tensor)
+
+        if rpc_task is not None:
+            await rpc_task
 
 
 class ServerAdapter(BaseRollout):

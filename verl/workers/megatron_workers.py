@@ -36,7 +36,7 @@ from megatron.core import parallel_state as mpu
 
 from verl import DataProto
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register, DYNAMIC_INDEX_DISPATCH
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
@@ -74,7 +74,6 @@ from verl.workers.config import HFModelConfig, McoreCriticConfig, RolloutConfig
 from verl.workers.critic.megatron_critic import MegatronPPOCritic
 from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
 from verl.workers.rollout import get_rollout_class
-from verl.utils.addon import save_log_by_rank
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -341,6 +340,41 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.rank == 0:
                 print_model_size(actor_module[0])
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
+
+            # rlpipe F2 idea2: build reverse-PP inference model alongside actor.
+            # Used by fused_update_policy to run iF in PP bubbles flowing
+            # rank P-1 → 0. Layer offsets / embedding / lm_head positions
+            # are flipped relative to the actor via monkey-patch context.
+            self.infer_module = None
+            if getattr(self.config.actor, "fused_forward", False):
+                from megatron.core import parallel_state as mpu
+                from megatron.core.process_groups_config import ProcessGroupCollection
+                from verl.utils.megatron.reverse_pp_model import build_reverse_pp_inference_model
+
+                actor_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+                pp_size = mpu.get_pipeline_model_parallel_world_size()
+                if pp_size > 1:
+                    self.infer_module = build_reverse_pp_inference_model(
+                        actor_tf_config=self.tf_config,
+                        actor_hf_config=self.hf_config,
+                        actor_pg_collection=actor_pg_collection,
+                        share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+                        parallel_output=True,
+                    )
+                    self.infer_module = self.infer_module.to(torch.cuda.current_device())
+                    if self.rank == 0:
+                        n_params = sum(p.numel() for p in self.infer_module.parameters())
+                        logger.info(
+                            "[fused_forward] reverse-PP infer module built: %d params on this rank",
+                            n_params,
+                        )
+                    log_gpu_memory_usage("After reverse-PP infer module init", logger=logger)
+                else:
+                    if self.rank == 0:
+                        logger.info(
+                            "[fused_forward] PP=1; skipping reverse-PP infer module build "
+                            "(no benefit at PP=1)"
+                        )
         elif self._is_ref:
             wrap_config = McoreModuleWrapperConfig(
                 is_value_model=False,  # ref is not value model
@@ -555,8 +589,56 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 bridge=self.bridge,
                 use_dist_checkpointing=self.config.actor.megatron.use_dist_checkpointing,
             )
+        # rlpipe F2 idea2: fused-forward gloo pair groups will be created
+        # lazily on first fused_update_policy call (also collective; deferring
+        # to that call site keeps init_model unchanged for non-fused configs
+        # and avoids the cross-worker-type collective coordination problem
+        # that an unconditional init here would create).
+        self._fused_pair_groups = None
+
         get_torch_device().empty_cache()
         log_gpu_memory_usage("After init_model finish", logger=logger)
+
+    async def _ensure_distributed_weight_sync_inited(self):
+        """Lazy init of distributed weight-sync NCCL group (Option B).
+
+        Both actor and sglang sides rendezvous at TCPStore master_addr:port.
+        Idempotent — only runs once per worker. Returns the coord object
+        (or None if mode is not "distributed").
+        """
+        if getattr(self.config.rollout, "weight_sync_mode", "tensor") != "distributed":
+            return None
+        if getattr(self, "_dist_weight_sync_coord", None) is not None:
+            return self._dist_weight_sync_coord
+
+        from verl.utils.megatron.distributed_weight_sync import DistributedWeightSyncCoordinator
+        sglang_tp_size = self.config.rollout.tensor_model_parallel_size
+        # Per-WORKER TCPStore: in hybrid mode each ray worker has its own
+        # actor + colocated sglang scheduler subprocess. They form a
+        # 2-member NCCL group privately, no cross-worker coordination
+        # needed. Port = base + world_rank, group name uniqued by world_rank
+        # to avoid any collisions.
+        from megatron.core import parallel_state as mpu
+        world_rank = torch.distributed.get_rank()
+        base_port = self.config.rollout.weight_sync_master_port
+        coord = DistributedWeightSyncCoordinator(
+            sglang_tp_size=sglang_tp_size,
+            master_addr=self.config.rollout.weight_sync_master_addr,
+            master_port=base_port + world_rank,
+            group_name=f"rlpipe_weight_update_w{world_rank}",
+        )
+
+        # Per-worker group: actor side is THIS worker's verl process,
+        # sglang side is THIS worker's sglang scheduler subprocess.
+        # No cross-worker coordination — every worker initializes its
+        # own pair group independently.
+        import asyncio
+        sglang_init_task = asyncio.create_task(self.rollout.init_weights_update_group(coord))
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, coord.init_actor_side)
+        await sglang_init_task
+        self._dist_weight_sync_coord = coord
+        return coord
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
@@ -581,7 +663,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
-        await self.rollout.update_weights(per_tensor_param)
+
+        # rlpipe Option B: NCCL collective replaces CUDA IPC when configured.
+        # See docs/rlpipe/option_b_distributed_weight_sync_plan.md
+        weight_sync_mode = getattr(self.config.rollout, "weight_sync_mode", "tensor")
+        if weight_sync_mode == "distributed":
+            coord = await self._ensure_distributed_weight_sync_inited()
+            # Per-worker group: every actor is "rank 0" in its own group and
+            # broadcasts to its colocated sglang. PP-shard gather already
+            # done by per_tensor_generator (every rank sees full tensors).
+            await self.rollout.update_weights_distributed(
+                per_tensor_param, coord=coord, actor_pp_rank=0,
+            )
+        else:
+            await self.rollout.update_weights(per_tensor_param)
+
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)
@@ -657,14 +753,162 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         return output
 
-    # @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
-    @register(dispatch_mode=DYNAMIC_INDEX_DISPATCH)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @GPUMemoryLogger(role="fused_update_actor", logger=logger)
+    @DistProfiler.annotate(color="red")
+    def fused_update_actor(self, data: DataProto):
+        """rlpipe F2 idea2 entrypoint.
+
+        Stub V1: runs compute_log_prob then update_policy back-to-back. Real
+        fusion (interleaving iF into the training PP schedule using
+        `forward_backward_fused_pipelining`) lands in M-B Step 5; the
+        contract (output: old_log_probs + metrics) and trainer wiring stay
+        the same.
+
+        Even in V1 we already copy actor → reverse-PP infer weights here so
+        the helper is exercised once per train step. Step 5 then replaces
+        the back-to-back compute with an interleaved schedule that consumes
+        infer_module.
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.actor_module)
+            log_gpu_memory_usage("After load actor params during fused_update_actor", logger=logger)
+        if self._is_offload_optimizer:
+            load_megatron_optimizer(self.actor_optimizer)
+
+        # Weight copy actor → reverse-PP infer (M-B Step 4)
+        if self.infer_module is not None:
+            from megatron.core import parallel_state as mpu
+            from verl.utils.megatron.reverse_pp_model import copy_actor_to_reverse_infer
+            from verl.utils.megatron_utils import unwrap_model
+
+            actor_gpt = unwrap_model(self.actor_module[0])
+            copy_actor_to_reverse_infer(
+                actor_gpt_model=actor_gpt,
+                infer_gpt_model=self.infer_module,
+                actor_pp_group=mpu.get_pipeline_model_parallel_group(),
+            )
+            log_gpu_memory_usage("After copy_actor_to_reverse_infer", logger=logger)
+
+        # 1) old_log_probs
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+
+        # M-B Step 5b-C: full fused (iF + tF/tB interleaved) via FusedPPExecutor.
+        # Currently uses PLACEHOLDER loss (output**2.sum() / M) — gradients
+        # are NOT correct for real training; this path is for ARCHITECTURE
+        # validation only. Step 5b-D will replace with real PPO loss.
+        use_dualpipe_v2 = (
+            os.environ.get("RLPIPE_FUSED_USE_DUALPIPE_V2", "0") == "1"
+            and self.infer_module is not None
+        )
+        # M-B Step 5a: iF-only via reverse-PP infer_module (no fusion with
+        # training; replaces only the compute_log_prob backend).
+        use_dualpipe = (
+            os.environ.get("RLPIPE_FUSED_USE_DUALPIPE", "0") == "1"
+            and self.infer_module is not None
+        )
+        if use_dualpipe_v2:
+            from megatron.core import parallel_state as mpu
+            from verl.utils.megatron.fused_training_executor import run_fused_forward_backward
+
+            log_gpu_memory_usage("Before dualpipe-v2 fused run", logger=logger)
+            mb_size = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            mbs = []
+            B = data.batch["input_ids"].shape[0]
+            for s in range(0, B, mb_size):
+                e = min(s + mb_size, B)
+                mbs.append({
+                    "input_ids": data.batch["input_ids"][s:e].to(torch.cuda.current_device()),
+                    "attention_mask": data.batch["attention_mask"][s:e].to(torch.cuda.current_device()),
+                    "position_ids": data.batch["position_ids"][s:e].to(torch.cuda.current_device()),
+                    "responses": data.batch["responses"][s:e].to(torch.cuda.current_device()),
+                })
+            pp_group = mpu.get_pipeline_model_parallel_group()
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            pp_world_ranks = torch.distributed.get_process_group_ranks(pp_group)
+            old_log_probs, fused_metrics = run_fused_forward_backward(
+                actor_module=self.actor_module,
+                infer_module=self.infer_module,
+                micro_batches=mbs,
+                pp_group=pp_group,
+                pp_world_ranks=pp_world_ranks,
+                temperature=self.config.rollout.temperature,
+                dtype=self.dtype,
+            )
+            log_gpu_memory_usage("After dualpipe-v2 fused run", logger=logger)
+            if self.rank == 0:
+                logger.info("[fused-v2] metrics: %s", fused_metrics)
+        elif use_dualpipe:
+            from megatron.core import parallel_state as mpu
+            from verl.utils.megatron.dualpipe_executor import compute_log_prob_reverse_pp
+
+            log_gpu_memory_usage("Before dualpipe compute_log_prob", logger=logger)
+            # Build micro-batch list from the data's batch
+            mb_size = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            mbs = []
+            B = data.batch["input_ids"].shape[0]
+            for s in range(0, B, mb_size):
+                e = min(s + mb_size, B)
+                mbs.append({
+                    "input_ids": data.batch["input_ids"][s:e].to(torch.cuda.current_device()),
+                    "attention_mask": data.batch["attention_mask"][s:e].to(torch.cuda.current_device()),
+                    "position_ids": data.batch["position_ids"][s:e].to(torch.cuda.current_device()),
+                    "responses": data.batch["responses"][s:e].to(torch.cuda.current_device()),
+                })
+            old_log_probs = compute_log_prob_reverse_pp(
+                infer_module=self.infer_module,
+                micro_batches=mbs,
+                pp_group=mpu.get_pipeline_model_parallel_group(),
+                temperature=self.config.rollout.temperature,
+            )
+            log_gpu_memory_usage("After dualpipe compute_log_prob", logger=logger)
+        else:
+            old_log_probs, _ = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+
+        # attach to data so update_policy sees it
+        data.batch["old_log_probs"] = old_log_probs.to(data.batch["responses"].device)
+
+        # 2) update_policy
+        micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        dataloader = self.actor.make_minibatch_iterator(data=data)
+        with Timer(name="fused_update_policy", logger=None) as timer:
+            metrics = self.actor.update_policy(dataloader=dataloader)
+        delta_time = timer.last
+        global_num_tokens = data.meta_info["global_token_num"]
+        estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+        metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+        metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+        metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+        metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+        from verl.utils.megatron.optimizer import get_megatron_last_lr
+
+        metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
+        self.actor_optimizer_scheduler.step(1)
+
+        output = DataProto.from_dict(
+            tensors={"old_log_probs": old_log_probs},
+            meta_info={"metrics": metrics, "temperature": self.config.rollout.temperature},
+        )
+        output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.actor_module)
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.actor_optimizer)
+        aggressive_empty_cache(force_sync=True)
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @GPUMemoryLogger(role="generate_sequences", logger=logger)
     @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
         prompts = prompts.to(get_device_name())
-        save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] {prompts=}")
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
             if self.generation_config is not None
@@ -684,12 +928,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
-            start_time = datetime.datetime.now()
-            save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] rollout start, {start_time=}")
             output = self.rollout.generate_sequences(prompts=prompts)
-            end_time = datetime.datetime.now()
-            save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] rollout end, {end_time=}")
-            save_log_by_rank(f"[Rank {torch.distributed.get_rank()}] rollout time, {end_time - start_time=}")
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())

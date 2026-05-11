@@ -93,7 +93,7 @@ class ServerConfig(BaseConfig):
 
 @dataclass
 class RolloutConfig(BaseConfig):
-    _mutable_fields = {"max_model_len", "load_format"}
+    _mutable_fields = {"max_model_len", "load_format", "tensor_model_parallel_size"}
 
     name: Optional[str] = MISSING
     mode: str = "sync"
@@ -156,6 +156,17 @@ class RolloutConfig(BaseConfig):
 
     update_weights_bucket_megabytes: int = 512
 
+    # Weight sync mode between training engine and inference engine.
+    # - "tensor": stock CUDA-IPC path (verl default; needs container CAP_SYS_PTRACE)
+    # - "distributed": NCCL collective broadcast over a TCPStore-rendezvous group
+    #   (rlpipe extension for ptrace-restricted docker — see
+    #   docs/rlpipe/option_b_distributed_weight_sync_plan.md)
+    weight_sync_mode: str = "tensor"
+    # Master address/port for the distributed weight-sync TCPStore. Both
+    # actor and sglang sides must agree. Only used when weight_sync_mode="distributed".
+    weight_sync_master_addr: str = "127.0.0.1"
+    weight_sync_master_port: int = 29600
+
     skip_rollout: bool = False
 
     skip_dump_dir: str = "/tmp/rollout_dump"
@@ -171,6 +182,30 @@ class RolloutConfig(BaseConfig):
     layered_summon: bool = False
 
     layer_name_map: dict = field(default_factory=dict)
+
+    tp_groups: Optional[list] = None  # e.g. [[0,1],[2],[3]] for heterogeneous TP
+
+    # Routing config (used by RolloutRouter in the trainer for het-TP dispatch)
+    routing_strategy: str = "round_robin"
+    routing_warmup_epochs: int = 1
+    routing_prompt_coef: float = 1.0
+    routing_response_coef: float = 4.0
+    routing_default_response_length: float = 1024.0
+    routing_history_estimator: str = "mean"
+    routing_ema_alpha: float = 0.5
+    routing_response_agg: str = "max"
+    routing_group_weights: Optional[list] = None
+    routing_random_seed: int = 0
+
+    # Progressive rollout: abort remaining requests when this fraction complete.
+    # None or 1.0 = disabled (default, wait for all). 0.9 = return when 90% done.
+    progressive_threshold: Optional[float] = None
+
+    # rlpipe dual-fleet fan-in rollout. When True, _build_rollout_heterogeneous
+    # picks DualFleetFanInRollout which launches 4 DP HTTP servers + 1 TP
+    # HTTP server on the TP leader and orchestrates dynamic DP→TP swap on
+    # tail. Requires tp_groups=[[0,1,2,3]] (single TP group).
+    enable_dual_fleet_fanin: bool = False
 
     sglang_engine_mode: str = "local"
 
@@ -190,3 +225,23 @@ class RolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+        if self.tp_groups is not None:
+            if self.name != "sglang":
+                raise ValueError("rollout.tp_groups is currently only supported for rollout.name='sglang'")
+            if not isinstance(self.tp_groups, list) or len(self.tp_groups) == 0:
+                raise ValueError("rollout.tp_groups must be a non-empty list of rank groups")
+
+            flat_ranks = []
+            for idx, group in enumerate(self.tp_groups):
+                if not isinstance(group, list) or len(group) == 0:
+                    raise ValueError(f"rollout.tp_groups[{idx}] must be a non-empty list of ranks")
+                for rank in group:
+                    if not isinstance(rank, int):
+                        raise ValueError(f"rollout.tp_groups[{idx}] contains non-integer rank {rank!r}")
+                    if rank < 0:
+                        raise ValueError(f"rollout.tp_groups[{idx}] contains negative rank {rank}")
+                    flat_ranks.append(rank)
+
+            if len(set(flat_ranks)) != len(flat_ranks):
+                raise ValueError(f"rollout.tp_groups must not contain duplicate ranks: {self.tp_groups!r}")

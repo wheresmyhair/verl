@@ -1,0 +1,14 @@
+# torch_pp actor config, inheriting from trainer/config/actor/actor.yaml
+defaults:
+  - actor
+  - _self_
+
+_target_: verl.workers.config.TorchPPActorConfig
+
+strategy: torch_naive_pp
+
+grad_clip: 1.0
+param_offload: False
+optimizer_offload: False
+fused_forward: False
+num_micro_batches: 4

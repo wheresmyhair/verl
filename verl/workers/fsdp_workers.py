@@ -845,14 +845,112 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
+        # rlpipe: step-level PPTracer for Perfetto, gated by env var
+        # RLPIPE_SGFANIN_TRACE=<save_dir>. Reuses verl/workers/torch_pp/pp_trace.py
+        # (framework-agnostic). Records phase boxes on "0 Phases GPU R" row:
+        # load_rollout / rollout / unload_rollout / compute_log_prob /
+        # compute_ref_log_prob / update_actor. Sub-phases inside rollout_mode
+        # and trainer_mode (resume_weights / update_weights / resume_kv_cache /
+        # release) are recorded on "1 GPU R" row to match the perfetto_example
+        # layout. Cross-process alignment uses time.time() captured at
+        # begin_step so post-hoc scheduler log events can be merged in.
+        self._pp_tracer = None
+        self._pp_trace_step = 0
+        self._pp_trace_wall_t0 = None  # time.time() at begin_step; used to align sched logs
+        self._pp_trace_save_dir = os.environ.get("RLPIPE_SGFANIN_TRACE")
+        if self._pp_trace_save_dir:
+            try:
+                import sys as _sys
+                _slot_name = "_rlpipe_pp_trace_slot"
+                _slot = _sys.modules.get(_slot_name)
+                if _slot is None:
+                    _slot = type(_sys)(_slot_name)
+                    _sys.modules[_slot_name] = _slot
+                if not hasattr(_slot, "tracer"):
+                    from verl.workers.torch_pp.pp_trace import PPTracer as _PPTracer
+                    _slot.tracer = _PPTracer(
+                        pp_rank=torch.distributed.get_rank(),
+                        pp_size=torch.distributed.get_world_size(),
+                        enabled=True,
+                        save_dir=self._pp_trace_save_dir,
+                    )
+                    _slot.step_counter = 0
+                    _slot.wall_t0 = None
+                self._pp_tracer = _slot.tracer
+                self._pp_trace_slot = _slot
+                logger.info(
+                    "[rlpipe sgfanin-trace] enabled, save_dir=%s rank=%d role=%s",
+                    self._pp_trace_save_dir, self._pp_tracer.pp_rank, self.role,
+                )
+            except Exception as _pp_err:
+                logger.warning("[rlpipe sgfanin-trace] failed to initialize: %s", _pp_err)
+                self._pp_tracer = None
+
+    def _pp_trace_begin_step_if_active(self):
+        """Start a new step. Idempotent — safe to call from multiple entry points."""
+        if self._pp_tracer is None:
+            return
+        if self._pp_tracer._step_start is not None:
+            return
+        _slot = getattr(self, "_pp_trace_slot", None)
+        if _slot is not None:
+            _slot.step_counter += 1
+            _step = _slot.step_counter
+        else:
+            self._pp_trace_step += 1
+            _step = self._pp_trace_step
+        try:
+            torch.distributed.barrier()
+        except Exception:
+            pass
+        import time as _time
+        wall_t0 = _time.time()
+        self._pp_trace_wall_t0 = wall_t0
+        if _slot is not None:
+            _slot.wall_t0 = wall_t0
+        self._pp_tracer.begin_step(step=_step)
+        # Record the wall_t0 as a metadata event so the post-processor can
+        # align scheduler log wall timestamps to this rank's trace base.
+        self._pp_tracer.events.append({
+            "name": f"wall_t0 rank{self._pp_tracer.pp_rank}",
+            "cat": "meta",
+            "ph": "I",
+            "ts": 0.0,
+            "pid": f"5 HBM GPU {self._pp_tracer.pp_rank}",
+            "tid": "memory",
+            "s": "g",
+            "args": {"wall_t0_unix": wall_t0},
+        })
+
+    def _pp_trace_end_step_if_active(self):
+        """Flush this rank's trace file and reset step state."""
+        if self._pp_tracer is None:
+            return
+        self._pp_tracer.end_step()
+        self._pp_tracer.events.clear()
+        self._pp_tracer._step_start = None
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+        _tracer = self._pp_tracer
+        _ua_outer = _tracer.phase("update_actor") if _tracer else None
+        if _ua_outer is not None:
+            _ua_outer.__enter__()
+        _lt_ctx = _tracer.phase("load_training") if _tracer else None
+        if _lt_ctx is not None:
+            _lt_ctx.__enter__()
+        try:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+        finally:
+            if _lt_ctx is not None:
+                _lt_ctx.__exit__(None, None, None)
+        if _tracer is not None:
+            _tracer.record_hbm("update_actor/after_load_training")
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
@@ -879,12 +977,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             output = output.to("cpu")
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        _ut_ctx = _tracer.phase("unload_training") if _tracer else None
+        if _ut_ctx is not None:
+            _ut_ctx.__enter__()
+        try:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        finally:
+            if _ut_ctx is not None:
+                _ut_ctx.__exit__(None, None, None)
+        if _tracer is not None:
+            _tracer.record_hbm("after_update_actor")
+        if _ua_outer is not None:
+            _ua_outer.__exit__(None, None, None)
+        # End of RL step — flush this rank's trace file.
+        self._pp_trace_end_step_if_active()
 
         return output
 
@@ -893,6 +1004,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
+        # Start of RL step — begin tracer (bumps step counter, barriers, writes base timestamp).
+        self._pp_trace_begin_step_if_active()
+        _tracer = self._pp_tracer
         prompts = prompts.to(get_device_id())
 
         meta_info = {
@@ -908,15 +1022,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
-            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            _lr_ctx = _tracer.phase("load_rollout") if _tracer else None
+            if _lr_ctx is not None:
+                _lr_ctx.__enter__()
+            try:
+                loop.run_until_complete(self.rollout_mode())
+                log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            finally:
+                if _lr_ctx is not None:
+                    _lr_ctx.__exit__(None, None, None)
+            if _tracer is not None:
+                _tracer.record_hbm("after_load_rollout")
 
-        with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+        _g_ctx = _tracer.phase("rollout") if _tracer else None
+        if _g_ctx is not None:
+            _g_ctx.__enter__()
+        try:
+            with simple_timer("generate_sequences", timing_generate):
+                output = self.rollout.generate_sequences(prompts=prompts)
+        finally:
+            if _g_ctx is not None:
+                _g_ctx.__exit__(None, None, None)
+        if _tracer is not None:
+            _tracer.record_hbm("after_rollout")
 
         if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
-            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+            _ur_ctx = _tracer.phase("unload_rollout") if _tracer else None
+            if _ur_ctx is not None:
+                _ur_ctx.__enter__()
+            try:
+                loop.run_until_complete(self.trainer_mode())
+                log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+            finally:
+                if _ur_ctx is not None:
+                    _ur_ctx.__exit__(None, None, None)
+            if _tracer is not None:
+                _tracer.record_hbm("after_unload_rollout")
 
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
@@ -944,6 +1085,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
+        _tracer = self._pp_tracer
+        _clp_ctx = _tracer.phase("compute_log_prob") if _tracer else None
+        if _clp_ctx is not None:
+            _clp_ctx.__enter__()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
@@ -977,6 +1122,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
+        if _clp_ctx is not None:
+            _clp_ctx.__exit__(None, None, None)
+        if _tracer is not None:
+            _tracer.record_hbm("after_compute_log_prob")
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -992,6 +1141,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert self._is_ref
         # else:
         # otherwise, the class have a standalone ref model
+
+        _tracer = self._pp_tracer
+        _cref_ctx = _tracer.phase("compute_ref_log_prob") if _tracer else None
+        if _cref_ctx is not None:
+            _cref_ctx.__enter__()
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
@@ -1013,6 +1167,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             elif fsdp_version(self.ref_policy.actor_module) == 2:
                 self.ref_policy.actor_module.reshard()
 
+        if _cref_ctx is not None:
+            _cref_ctx.__exit__(None, None, None)
+        if _tracer is not None:
+            _tracer.record_hbm("after_compute_ref_log_prob")
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

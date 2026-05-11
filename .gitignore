@@ -129,3 +129,8 @@ outputs
 .jsonl
 log_rank_*.txt
 log.txt
+log_*.txt
+
+# profiling
+profiling/
+profiling_fused/
